@@ -33,6 +33,29 @@ from typing import TYPE_CHECKING
 from .errors import Forbidden, PartyError
 from .enums import Platform, AwayStatus
 
+
+def _parse_presence_value(value):
+    """Decode an EOS presence property prefix (``b``, ``i``, ``m`` or ``s``)."""
+    if not isinstance(value, str) or not value:
+        return value
+
+    kind, raw = value[0], value[1:]
+    if kind == 'b':
+        return raw == 'true'
+    if kind == 'i':
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+    if kind == 'm':
+        try:
+            return json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+    if kind == 's':
+        return raw
+    return value
+
 if TYPE_CHECKING:
     from .client import Client
     from .friend import Friend
@@ -175,17 +198,19 @@ class PresenceParty:
         pl = data.get('sP')
         self.platform = Platform(pl) if pl is not None else None
         self.private = data.get('bIsPrivate', False)
-        self.id = data.get('p')
-        self.app_id = data.get('d')
-        self.build_id = data.get('b')
+        self.id = data.get('partyId', data.get('p'))
+        self.app_id = data.get('appId', data.get('d'))
+        self.build_id = data.get('buildId', data.get('b'))
 
         if self.build_id is not None and self.build_id.startswith('1:3:'):
             self.net_cl = self.build_id[4:]
         else:
             self.net_cl = None
 
-        self.party_flags = data.get('f')
-        self.not_accepting_reason = data.get('nAR')
+        self.party_flags = data.get('partyFlags', data.get('f'))
+        self.not_accepting_reason = data.get(
+            'notAcceptingReason', data.get('nAR')
+        )
 
         self.playercount = data.get('pc')
         if self.playercount is not None:
@@ -214,13 +239,26 @@ class PresenceParty:
         :class:`ClientParty`
             The party that was just joined.
         """
-        if self.client.party.id == self.id:
+        if self.client.party is not None and (
+            self.client.party.id == self.id
+            or self.client.party.epic_party_id == self.id
+        ):
             raise PartyError('You are already a member of this party.')
 
         if self.private:
             raise Forbidden('You cannot join a private party.')
 
-        return await self.client.join_legacy_party(self.id)
+        party_id = self.id or ''
+        if re.fullmatch(r'[0-9a-fA-F]{32}', party_id):
+            return await self.client.join_party(party_id)
+
+        lobby = re.fullmatch(
+            r'([0-9a-fA-F]{32})-\d+-[A-Za-z0-9_-]+', party_id
+        )
+        if lobby:
+            return await self.client.join_party(lobby.group(1))
+
+        return await self.client.join_legacy_party(party_id)
 
 
 class Presence:
@@ -291,88 +329,119 @@ class Presence:
         raw: dict
     ) -> None:
         self.client = client
-        from_id = raw['accountId']
+        from_id = raw.get('accountId') if isinstance(raw, dict) else None
+        per_ns = raw.get('perNs') if isinstance(raw, dict) else None
+        if not isinstance(per_ns, list) or not per_ns:
+            data = {}
+        else:
+            data = next(
+                (
+                    entry for entry in per_ns
+                    if isinstance(entry, dict) and (
+                        entry.get('productId') == 'Fortnite'
+                        or entry.get('ns') == client.deployment_id
+                    )
+                ),
+                per_ns[0] if isinstance(per_ns[0], dict) else {},
+            )
 
-        self.friend = self.client.get_friend(from_id)
+        self.friend = self.client.get_friend(from_id) if from_id else None
         self.received_at = datetime.datetime.utcnow()
-        self.away = AwayStatus.AWAY if raw['status'] == 'away' \
+        online_type = raw.get('status') if isinstance(raw, dict) else None
+        if online_type is None and isinstance(data, dict):
+            online_type = data.get('status')
+        self.away = AwayStatus.AWAY if online_type == 'away' \
             else AwayStatus.ONLINE
 
-        data = (raw.get('perNs') or [{}])[0]
-
-        self.status = data.get('status')
-
-        raw_properties = {
-            key: (
-                value[1:] if isinstance(value, str)
-                and not key.startswith('EOS_') else value
-            )
-            for key, value in data.get('props', {}).items()
-        }
-        self.has_properties = raw_properties != {}
-
-        # All values below will be "None" if properties is empty.
-
-        self.platform = Platform(raw_properties.get('EOS_Platform'))
-
-        self.session_id = raw_properties.get('SessionIdAttributeKey') or None
-
-        _basic_info = json.loads(raw_properties.get('FortBasicInfo', '{}'))
-        self.homebase_rating = _basic_info.get('homeBaseRating')
-
-        if raw_properties.get('FortLFG') is None:
-            self.lfg = None
+        activity = data.get('activity') if isinstance(data, dict) else None
+        if isinstance(activity, dict):
+            self.status = activity.get('value')
+        elif isinstance(data, dict):
+            self.status = data.get('status')
         else:
-            self.lfg = int(raw_properties.get('FortLFG')) == 1
+            self.status = None
 
-        self.sub_game = raw_properties.get('FortSubGame')
+        props = data.get('props') if isinstance(data, dict) else None
+        if not isinstance(props, dict):
+            props = {}
 
-        self.in_unjoinable_match = raw_properties.get(
-            'InUnjoinableMatch'
-        )
-        if self.in_unjoinable_match is not None:
-            self.in_unjoinable_match = \
-                True if self.in_unjoinable_match == 'true' else False
+        def prop(name):
+            if name not in props:
+                return None
+            value = props[name]
+            if isinstance(name, str) and name.startswith('EOS_'):
+                return value
+            return _parse_presence_value(value)
 
-        self.playlist = None or raw_properties.get('GamePlaylistName')
-        self.island_code = None or raw_properties.get('IslandCode')
+        self.has_properties = props != {}
 
-        players_alive = raw_properties.get('Event_PlayersAlive')
-        if players_alive is not None:
+        platform_value = prop('EOS_Platform')
+        try:
+            self.platform = Platform(platform_value) if platform_value else None
+        except ValueError:
+            self.platform = None
+
+        self.session_id = prop('SessionIdAttributeKey') or None
+
+        basic_info = prop('FortBasicInfo')
+        if not isinstance(basic_info, dict):
+            basic_info = {}
+        self.homebase_rating = basic_info.get('homeBaseRating')
+
+        lfg = prop('FortLFG')
+        self.lfg = None if lfg is None else int(lfg) == 1
+
+        self.sub_game = prop('FortSubGame')
+
+        unjoinable = prop('InUnjoinableMatch')
+        if unjoinable is None:
+            self.in_unjoinable_match = None
+        elif isinstance(unjoinable, bool):
+            self.in_unjoinable_match = unjoinable
+        else:
+            self.in_unjoinable_match = str(unjoinable) == 'true'
+
+        self.playlist = prop('GamePlaylistName')
+        self.island_code = prop('IslandCode')
+
+        players_alive = prop('Event_PlayersAlive')
+        if isinstance(players_alive, str) and players_alive.isdigit():
             players_alive = int(players_alive)
 
-        self.party_size = raw_properties.get('Event_PartySize')
-        if self.party_size is not None:
+        self.party_size = prop('FortPartySize')
+        if self.party_size is None:
+            self.party_size = prop('Event_PartySize')
+        if isinstance(self.party_size, str) and str(self.party_size).isdigit():
             self.party_size = int(self.party_size)
 
-        self.max_party_size = raw_properties.get('Event_PartyMaxSize')
-        if self.max_party_size is not None:
+        self.max_party_size = prop('Event_PartyMaxSize')
+        if isinstance(self.max_party_size, str) and str(self.max_party_size).isdigit():
             self.max_party_size = int(self.max_party_size)
 
-        self.server_player_count = raw_properties.get(
-            'ServerPlayerCount'
-        )
-        if self.server_player_count is not None:
+        self.server_player_count = prop('ServerPlayerCount')
+        if isinstance(self.server_player_count, str) and str(self.server_player_count).isdigit():
             self.server_player_count = int(self.server_player_count)
 
-        if 'FortGameplayStats' in raw_properties:
+        gameplay = prop('FortGameplayStats')
+        if isinstance(gameplay, dict):
             self.gameplay_stats = PresenceGameplayStats(
                 self.friend,
-                json.loads(raw_properties['FortGameplayStats']),
-                players_alive,
+                gameplay,
+                players_alive if isinstance(players_alive, int) else None,
                 self.playlist
             )
         else:
             self.gameplay_stats = None
 
         key = "party.joininfodata.286331153"
-        if key not in raw_properties:
+        party_data = prop(key)
+        if not isinstance(party_data, dict):
             self.party = None
             self.joinable = None
         else:
             self.party = PresenceParty(
                 self.client,
-                json.loads(raw_properties[key])
+                party_data
             )
             self.joinable = not self.party.private
 

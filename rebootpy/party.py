@@ -36,6 +36,44 @@ from collections import OrderedDict
 
 from .enums import Enum, Region
 from .errors import PartyError, Forbidden, HTTPException
+
+
+def _variant_channels(variants):
+    """Build a cosmetic variant array, ignoring invalid channel indexes.
+
+    Classic ``{c, v, dE}`` entries are left untouched. Entries that carry a
+    ``channelIndex`` are placed in a zero-filled list. Non-integer indexes
+    are skipped so they cannot produce an invalid array.
+    """
+    if not isinstance(variants, list) or not variants:
+        return [] if variants is None else variants
+
+    indexed = []
+    for variant in variants:
+        if not isinstance(variant, dict):
+            return variants
+        if 'channelIndex' in variant or 'channel_index' in variant:
+            indexed.append(variant)
+        else:
+            return variants
+
+    highest = -1
+    parsed = []
+    for variant in indexed:
+        channel = variant.get('channelIndex', variant.get('channel_index'))
+        if isinstance(channel, bool) or not isinstance(channel, int):
+            continue
+        if channel < 0:
+            continue
+        value = variant.get('variantIndex', variant.get('variant_index', 0))
+        parsed.append((channel, value))
+        if channel > highest:
+            highest = channel
+
+    channels = [0] * (highest + 1)
+    for channel, value in parsed:
+        channels[channel] = value
+    return channels
 from .user import User
 from .friend import Friend
 from .enums import (PartyPrivacy, PartyDiscoverability, PartyJoinability,
@@ -409,7 +447,10 @@ class Patchable:
                             deleted=_deleted,
                             **kwargs
                         )
-                        self.revision += 1
+                        if not getattr(self, '_suppress_revision_bump', False):
+                            self.revision += 1
+                        else:
+                            self._suppress_revision_bump = False
                         return updated, deleted
                     except HTTPException as exc:
                         m = 'errors.com.epicgames.social.party.stale_revision'
@@ -712,7 +753,7 @@ class PartyMemberMeta(MetaBase):
                     "location": "PreLobby",
                     "gameMode": "None",
                     "voiceChatStatus": "Enabled",
-                    "hasCompletedSTWTutorial": False,
+                    "hasCompletedSTWTutorial": True,
                     "hasPurchasedSTW": False,
                     "platformSupportsSTW": True,
                     "bDownloadOnDemandActive": False,
@@ -817,6 +858,19 @@ class PartyMemberMeta(MetaBase):
                 "BattlePassInfo": {
                     "bHasPurchasedPass": False,
                     "passLevel": 1
+                }
+            }),
+            "ePV": "1.0",
+            "Default:AthenaBannerInfo_j": json.dumps({
+                "AthenaBannerInfo": {
+                    "bannerIconId": "",
+                    "bannerColorId": "",
+                    "seasonLevel": 1
+                }
+            }),
+            "Default:Extensions_j": json.dumps({
+                "Extensions": {
+                    "channels": {}
                 }
             }),
             "Default:MpLoadout1_j": json.dumps({
@@ -1385,7 +1439,7 @@ class PartyMemberMeta(MetaBase):
     def set_variants(self, variants: List[dict], _type: str) -> Dict[str, Any]:
         data = self.mp_loadout
 
-        data[_type]['v'] = variants
+        data[_type]['v'] = _variant_channels(variants)
 
         final = {'MpLoadout1': {"s": data}}
         key = 'Default:MpLoadout1_j'
@@ -1445,6 +1499,12 @@ class PartyMemberMeta(MetaBase):
         data = (self.get_prop('Default:MatchmakingInfo_j'))['MatchmakingInfo']
 
         data['readyStatus'] = state
+        if state == 'Ready':
+            data['readyInputType'] = 'Touch'
+            data['readyStatusMMId'] = uuid.uuid4().hex.upper()
+        else:
+            data['readyInputType'] = 'Count'
+            data['readyStatusMMId'] = ''
 
         final = {'MatchmakingInfo': data}
         return {key: self.set_prop(key, final)}
@@ -1600,6 +1660,7 @@ class PartyMeta(MetaBase):
             "Default:GameSessionKey_s": "",
             "Default:HestiaBeautyGameSessionId_s": "",
             "Default:AllowJoinInProgress_b": "false",
+            "Default:AthenaSquadFill_b": "true",
             "Default:MatchmakingDelay_U": "0",
             "Default:CreativeInGameReadyCheckStatus_s": "None",
             "Default:PreferredPrivacy_s": "NoFill",
@@ -2449,14 +2510,44 @@ class ClientPartyMember(PartyMemberBase, Patchable):
         if self._dummy:
             return
 
-        await self.client.http.party_update_member_meta(
-            party_id=self.party.id,
-            user_id=self.id,
-            updated_meta=updated,
-            deleted_meta=deleted,
-            revision=self.revision,
-            **kwargs
-        )
+        updated = dict(updated or {})
+        if getattr(self.party, 'epic_party_id', None):
+            updated = {
+                key: value for key, value in updated.items()
+                if key.startswith('Default:')
+            }
+
+        items = list(updated.items())
+        deleted = list(deleted or [])
+        if not items and not deleted:
+            self._suppress_revision_bump = True
+            return
+
+        chunks = [
+            dict(items[index:index + 32])
+            for index in range(0, max(len(items), 1), 32)
+        ]
+        for index, chunk in enumerate(chunks):
+            while True:
+                try:
+                    await self.client.http.party_update_member_meta(
+                        party_id=self.party.id,
+                        user_id=self.id,
+                        updated_meta=chunk,
+                        deleted_meta=deleted if index == 0 else [],
+                        revision=self.revision,
+                        **kwargs
+                    )
+                    break
+                except HTTPException as exc:
+                    if exc.message_code != (
+                        'errors.com.epicgames.social.party.stale_revision'
+                    ):
+                        raise
+                    self.revision = int(exc.message_vars[1])
+
+            if index < len(chunks) - 1:
+                self.revision += 1
 
     def update_meta_config(self, data: dict, **kwargs) -> None:
         # In case the default party member config has been overridden, the
@@ -3755,6 +3846,8 @@ class PartyBase:
         self._applicants = data.get('applicants', [])
         self._squad_assignments = OrderedDict()
         self.epic_party_id = data.get('epic_party_id')
+        self.is_reportable = bool(data.get('is_reportable', False))
+        self._reportable_locked = False
 
         if self.epic_party_id is None and self._id:
             match = re.match(r'^([0-9a-f]{32})-\d+-default$', self._id, re.IGNORECASE)
@@ -3767,6 +3860,19 @@ class PartyBase:
 
     def __str__(self) -> str:
         return self.id
+
+    def set_reportable(self, reportable: bool, *, from_chat: bool = False) -> None:
+        """Remember whether party chat messages must be reportable.
+
+        A chat membership notification is authoritative. Later party-service
+        updates must not replace it.
+        """
+        if self._reportable_locked and not from_chat:
+            return
+
+        self.is_reportable = bool(reportable)
+        if from_chat:
+            self._reportable_locked = True
 
     def __eq__(self, other):
         return isinstance(other, PartyBase) and other._id == self._id

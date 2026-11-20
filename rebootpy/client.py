@@ -64,6 +64,34 @@ from .utils import LockEvent, MaybeLock, from_iso, to_iso, is_display_name
 
 log = logging.getLogger(__name__)
 
+_DEFAULT_CONNECTION_RETRY_BACKOFF = (5.0, 15.0, 60.0, 600.0)
+
+
+def _normalize_retry_backoff(name: str, value: Any) -> Tuple[float, ...]:
+    if value is None:
+        return _DEFAULT_CONNECTION_RETRY_BACKOFF
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        value = (value,)
+    if not isinstance(value, (list, tuple)) or len(value) == 0:
+        raise TypeError(
+            '{0} must be a non-empty sequence of delays in seconds'.format(
+                name
+            )
+        )
+
+    delays = []
+    for delay in value:
+        if isinstance(delay, bool) or not isinstance(delay, (int, float)):
+            raise TypeError(
+                '{0} delays must be numbers of seconds'.format(name)
+            )
+        if delay < 0:
+            raise ValueError(
+                '{0} delays must be zero or greater'.format(name)
+            )
+        delays.append(float(delay))
+    return tuple(delays)
+
 
 class StartContext:
     def __init__(self, client: 'BasicClient',
@@ -503,6 +531,9 @@ class BasicClient:
         )
 
         self.kill_other_sessions = kwargs.get('kill_other_sessions', True)
+        self.restart_on_invalid_refresh = kwargs.get(
+            'restart_on_invalid_refresh', False
+        )
         self.supports_non_eg1 = True
         self.accept_eula = True
         self.event_prefix = 'event_'
@@ -523,6 +554,7 @@ class BasicClient:
 
         self._refresh_task = None
         self._start_runner_task = None
+        self._invalid_refresh_recovery = None
         self._closed = False
         self._closing = False
         self._restarting = False
@@ -849,6 +881,51 @@ class BasicClient:
             close_http=close_http,
             dispatch_close=dispatch_close
         )
+
+    async def recover_from_invalid_refresh(self) -> None:
+        """|coro|
+
+        Attempts one fresh login after a confirmed invalid refresh token.
+        A second failure disconnects the client.
+        """
+        current = self._invalid_refresh_recovery
+        if current is not None and not current.done():
+            await current
+            return
+
+        async def _run() -> None:
+            log.debug(
+                'Refresh token invalid; restarting with configured credentials'
+            )
+            try:
+                await self.auth.reauthenticate(
+                    priority=self._reauth_lock.priority
+                )
+            except NotImplementedError:
+                log.debug(
+                    'Configured credentials cannot refresh this session'
+                )
+                raise
+            except Exception:
+                log.debug('Authentication restart failed; disconnecting')
+                try:
+                    await self.close()
+                except Exception:
+                    log.debug(
+                        'Disconnect failed after authentication restart'
+                    )
+                return
+
+            self.dispatch_event('internal_auth_refresh')
+            self.dispatch_event('auth_refresh')
+
+        task = self.loop.create_task(_run())
+        self._invalid_refresh_recovery = task
+        try:
+            await task
+        finally:
+            if self._invalid_refresh_recovery is task:
+                self._invalid_refresh_recovery = None
 
     def is_closed(self) -> bool:
         """:class:`bool`: Whether the client is running or not."""
@@ -2846,6 +2923,21 @@ class Client(BasicClient):
         is set to false, then the client will attempt to reconnect to the party on a
         startup. If :attr:`DefaultPartyMemberConfig.offline_ttl` is exceeded before
         a reconnect is attempted, then the client will create a new party at startup.
+    status_update_interval: :class:`float`
+        How many seconds to wait before refreshing the client's status.
+        Defaults to ``600`` (10 minutes). Set to ``0`` to disable.
+    xmpp_max_connection_retries: :class:`int`
+        How many times XMPP may try to reconnect after a drop. Defaults to ``4``.
+    xmpp_connection_retry_backoff: Sequence[:class:`float`]
+        Reconnect delays in seconds. Defaults to 5 seconds, 15 seconds,
+        1 minute and 10 minutes. Extra attempts repeat the last delay.
+    stomp_max_connection_retries: :class:`int`
+        How many times STOMP may try to reconnect after a drop. Defaults to ``4``.
+    stomp_connection_retry_backoff: Sequence[:class:`float`]
+        Reconnect delays in seconds. Uses the same default schedule as XMPP.
+    restart_on_invalid_refresh: :class:`bool`
+        When ``True``, one fresh login is attempted after an invalid refresh
+        token. A second failure disconnects the client. Defaults to ``False``.
 
     Attributes
     ----------
@@ -2873,6 +2965,25 @@ class Client(BasicClient):
         self.fetch_user_data_in_events = kwargs.get('fetch_user_data_in_events', True)  # noqa
         self.wait_for_member_meta_in_events = kwargs.get('wait_for_member_meta_in_events', True)  # noqa
         self.leave_party_at_shutdown = kwargs.get('leave_party_at_shutdown', True)  # noqa
+        self.status_update_interval = kwargs.get('status_update_interval', 600)
+        self.xmpp_max_connection_retries = kwargs.get(
+            'xmpp_max_connection_retries', 4
+        )
+        self.stomp_max_connection_retries = kwargs.get(
+            'stomp_max_connection_retries', 4
+        )
+        self.xmpp_connection_retry_backoff = _normalize_retry_backoff(
+            'xmpp_connection_retry_backoff',
+            kwargs.get('xmpp_connection_retry_backoff'),
+        )
+        self.stomp_connection_retry_backoff = _normalize_retry_backoff(
+            'stomp_connection_retry_backoff',
+            kwargs.get('stomp_connection_retry_backoff'),
+        )
+        self.restart_on_invalid_refresh = kwargs.get(
+            'restart_on_invalid_refresh',
+            self.restart_on_invalid_refresh,
+        )
 
         self.supports_non_eg1 = False
         self.xmpp = XMPPClient(self, ws_connector=kwargs.get('ws_connector'))
@@ -2915,6 +3026,8 @@ class Client(BasicClient):
         self._epic_party_last_recreate_at = 0.0
 
         self._reconnecting_to_party = False
+        self._party_recovery = None
+        self._status_update_task = None
 
         self.setup_internal()
 
@@ -3133,6 +3246,7 @@ class Client(BasicClient):
         log.debug('Party created')
 
         self.start_epic_party_service()
+        self._start_status_updates()
 
     def _clear_caches(self) -> None:
         super()._clear_caches()
@@ -3149,6 +3263,7 @@ class Client(BasicClient):
         self._closing = True
 
         self.stop_epic_party_service()
+        self._stop_status_updates()
 
         if self.leave_party_at_shutdown:
             try:
@@ -3297,6 +3412,88 @@ class Client(BasicClient):
                 'connection-rebind-failed', epic_party_id
             )
 
+    def _presence_online_type(self) -> str:
+        away = getattr(self, 'away', None)
+        value = away.value if isinstance(away, AwayStatus) else away
+        return value or 'online'
+
+    def _presence_island_code(self) -> str:
+        party = self.party
+        if party is None:
+            return ''
+        try:
+            playlist = party.playlist_info[0]
+        except Exception:
+            return ''
+        return playlist or ''
+
+    def _presence_is_public(self) -> bool:
+        party = self.party
+        if party is None:
+            return False
+        privacy = party.config.get('privacy', {})
+        permission = privacy.get('presencePermission')
+        if permission == 'Anyone':
+            return True
+        me = getattr(party, 'me', None)
+        return permission == 'Leader' and me is not None and me.leader
+
+    def _start_status_updates(self) -> None:
+        self._stop_status_updates()
+        interval = getattr(self, 'status_update_interval', 0) or 0
+        if interval <= 0:
+            return
+        self._status_update_task = self.loop.create_task(
+            self._status_update_loop(interval)
+        )
+
+    def _stop_status_updates(self) -> None:
+        task = getattr(self, '_status_update_task', None)
+        if task is not None and not task.done():
+            task.cancel()
+        self._status_update_task = None
+
+    async def _status_update_loop(self, interval: float) -> None:
+        while True:
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                return
+
+            if not self.is_ready():
+                continue
+            if self.websocket.connection_id is None:
+                continue
+            try:
+                await self.send_eos_presence()
+            except Exception as exc:
+                log.debug('Status refresh failed: %s', exc)
+
+    async def recover_party(self, had_party: bool) -> None:
+        """|coro|
+
+        Restores a party that existed before a connection drop.
+        Nothing is created when the client was not in a party.
+        """
+        if not had_party or self.disable_epic_party_service:
+            return
+
+        current = self._party_recovery
+        if current is not None and not current.done():
+            await current
+            return
+
+        async def _run() -> None:
+            await self._reconnect_to_party()
+
+        task = self.loop.create_task(_run())
+        self._party_recovery = task
+        try:
+            await task
+        finally:
+            if self._party_recovery is task:
+                self._party_recovery = None
+
     async def send_eos_presence(self, raw_status: Optional[dict] = None) -> None:
         connection_id = self.websocket.connection_id
         if not connection_id:
@@ -3326,14 +3523,14 @@ class Client(BasicClient):
         social_status_json = json.dumps({'attendingSocialEventIds': []})
 
         payload = {
-            'status': 'online',
+            'status': self._presence_online_type(),
             'activity': {'value': status_value},
             'props': {
                 'FortBasicInfo': f'm{json.dumps({"homeBaseRating": 0})}',
                 'FortLFG': 'i0',
                 'FortPartySize': f'i{party_size}',
                 'FortSubGame': 'i1',
-                'IslandCode': 'sexperience_br',
+                'IslandCode': f's{self._presence_island_code()}',
                 'IsInZone': 'bfalse',
                 'FortGameplayStats': f'm{gameplay_stats_json}',
                 'SocialStatus': f'm{social_status_json}',
@@ -3350,9 +3547,24 @@ class Client(BasicClient):
             'conn': {'props': {}},
         }
 
+        if self.party is not None and self._presence_is_public():
+            join_info = {
+                "sDN": self.user.display_name,
+                "sP": self.platform.value,
+                "p": self.party.id,
+                "d": "Fortnite",
+                "b": self.party_build_id,
+                "f": 6,
+                "nAR": 0,
+                "pc": self.party.member_count,
+            }
+            payload['props']['party.joininfodata.286331153'] = (
+                'm' + json.dumps(join_info)
+            )
+
         epic_party_id = self.party.epic_party_id if self.party else None
         internal_presence = {
-            'status': 'online',
+            'status': self._presence_online_type(),
             'activity': {},
             'conn': {'props': {}},
         }
@@ -3474,7 +3686,11 @@ class Client(BasicClient):
             epic_party['id'], lobby_id, lobby_config, priority=priority
         )
 
-        return lobby, epic_party['id']
+        return (
+            lobby,
+            epic_party['id'],
+            bool(epic_party.get('is_reportable', False)),
+        )
 
     async def join_party(self, epic_party_id: str) -> ClientParty:
         """|coro|
@@ -3658,6 +3874,10 @@ class Client(BasicClient):
             join_requests = data.get('join_requests') or []
             current = data.get('current') or None
             local_epic_party_id = self.party.epic_party_id if self.party else None  # noqa
+
+            if current and isinstance(current.get('is_reportable'), bool):
+                if self.party is not None:
+                    self.party.set_reportable(current['is_reportable'])
 
             if current and current.get('revision') is not None:
                 try:
@@ -4274,12 +4494,13 @@ class Client(BasicClient):
                 cf = self.default_party_config.config
 
             epic_party_id = None
+            reportable = False
             data = None
             if (not self.disable_epic_party_service
                     and self.websocket.connection_id is not None
                     and self.auth.eas_access_token is not None):
                 try:
-                    data, epic_party_id = await self._create_epic_party(
+                    data, epic_party_id, reportable = await self._create_epic_party(
                         cf, priority=priority
                     )
                 except Exception as e:
@@ -4322,6 +4543,7 @@ class Client(BasicClient):
             party = self.construct_party(data)
             if epic_party_id:
                 party.epic_party_id = epic_party_id
+                party.set_reportable(reportable)
             await party._update_members(
                 members=data['members'],
                 priority=priority

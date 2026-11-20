@@ -124,18 +124,18 @@ class Auth:
         return data['version'] if isinstance(data, dict) else 0
 
     async def accept_eula(self, **kwargs: Any) -> None:
+        try:
+            await self.client.http.fortnite_grant_access(**kwargs)
+        except HTTPException as e:
+            if e.message_code != 'errors.com.epicgames.bad_request':
+                raise
+
         version = await self.get_eula_version(**kwargs)
         if version != 0:
             await self.client.http.eulatracking_accept(
                 version,
                 **kwargs
             )
-
-            try:
-                await self.client.http.fortnite_grant_access(**kwargs)
-            except HTTPException as e:
-                if e.message_code != 'errors.com.epicgames.bad_request':
-                    raise
 
     def _update_ios_data(self, data: dict) -> None:
         self.ios_access_token = data['access_token']
@@ -300,7 +300,7 @@ class Auth:
         min_expires_at = min(expires)
 
         subtracted = min_expires_at - datetime.datetime.now(datetime.timezone.utc)
-        self.token_timeout = (subtracted).total_seconds() - 300
+        self.token_timeout = max(0.0, subtracted.total_seconds() - 300)
         await asyncio.sleep(self.token_timeout)
 
     async def run_refresh_loop(self) -> None:
@@ -317,7 +317,17 @@ class Auth:
                 if not pending.cancelled():
                     pending.cancel()
 
-            await self.do_refresh()
+            try:
+                await self.do_refresh()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not getattr(
+                    self.client, 'restart_on_invalid_refresh', False
+                ):
+                    raise
+                log.debug('Scheduled session refresh failed: %s', exc)
+                await asyncio.sleep(30)
 
     async def do_refresh(self) -> None:
         reauth_lock = self.client._reauth_lock
@@ -353,8 +363,29 @@ class Auth:
             except (HTTPException, AttributeError) as exc:
                 m = 'errors.com.epicgames.account.auth_token.' \
                     'invalid_refresh_token'
-                if isinstance(exc, HTTPException) and exc.message_code != m:
+                invalid_grant = (
+                    isinstance(exc, HTTPException)
+                    and isinstance(getattr(exc, 'raw', None), dict)
+                    and exc.raw.get('error') == 'invalid_grant'
+                )
+                if (
+                    isinstance(exc, HTTPException)
+                    and exc.message_code != m
+                    and not invalid_grant
+                ):
                     raise
+
+                if (
+                    getattr(self.client, 'restart_on_invalid_refresh', False)
+                    and self.client.is_ready()
+                ):
+                    log.debug(
+                        'Invalid refresh token was supplied. Attempting one '
+                        'fresh login.'
+                    )
+                    await self.client.recover_from_invalid_refresh()
+                    self.refresh_i += 1
+                    return
 
                 log.debug(
                     'Invalid refresh token was supplied. Attempting to '
@@ -1121,7 +1152,7 @@ class AdvancedAuth(Auth):
         data = await self.grant_eos_external_auth_token(
             self.eas_access_token,
             priority=priority
-        ),
+        )
         self._update_eos_data(data)
         log.debug('Successfully reauthenticated.')
 

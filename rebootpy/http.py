@@ -1999,7 +1999,7 @@ class HTTPClient:
                                  ) -> Any:
         if not self.client.party:
             payload = {
-                "status": "online",
+                "status": self.client._presence_online_type(),
                 "props": {
                     "EOS_Platform": self.client.platform.value,
                     "EOS_IntegratedPlatform": "EGS",
@@ -2022,7 +2022,7 @@ class HTTPClient:
             )
 
             payload = {
-                "status": "online",
+                "status": self.client._presence_online_type(),
                 "activity": {
                     "value": formatted_status
                 },
@@ -2033,7 +2033,7 @@ class HTTPClient:
                         }
                     )}",
                     "FortLFG": "i0",
-                    "FortPartySize": "i1",
+                    "FortPartySize": f"i{self.client.party.member_count}",
                     "FortSubGame": "i1",
                     "IslandCode": f"s{self.client.party.playlist_info[0]}",
                     "IsInZone": "bfalse",
@@ -2075,7 +2075,9 @@ class HTTPClient:
             perm = self.client.party.config['privacy'][
                 'presencePermission'
             ]
-            if perm == 'Anyone':
+            me = getattr(self.client.party, 'me', None)
+            is_leader = me is not None and me.leader
+            if perm == 'Anyone' or (perm == 'Leader' and is_leader):
                 payload["props"][
                     "party.joininfodata.286331153"
                 ] = f"m{json.dumps(
@@ -2204,7 +2206,8 @@ class HTTPClient:
 
             raise exc
 
-    async def party_send_message(self, content: str) -> Any:
+    async def party_send_message(self, content: str,
+                                  retry_on_fail: bool = True) -> Any:
         if len(content) >= 2048:
             raise ChatError("Message body exceeds max length of 2048")
 
@@ -2237,7 +2240,9 @@ class HTTPClient:
             "message": {
                 "body": body
             },
-            "isReportable": False,
+            "isReportable": bool(getattr(
+                self.client.party, 'is_reportable', False
+            )),
             "metadata": {
                 "TmV": "2",
                 "Pub": self.client.key_data.get("jwt"),
@@ -2255,7 +2260,23 @@ class HTTPClient:
             conversation_id=addressed,
             client_id=self.client.user.id
         )
-        return await self.post(r, json=payload, auth="EAS_ACCESS_TOKEN")
+        try:
+            return await self.post(r, json=payload, auth="EAS_ACCESS_TOKEN")
+        except HTTPException as exc:
+            if (
+                retry_on_fail
+                and exc.message_code
+                == "errors.com.epicgames.social.chat.is_reportable_mismatch"
+            ):
+                party = self.client.party
+                if party is not None:
+                    party.set_reportable(
+                        not party.is_reportable, from_chat=True
+                    )
+                return await self.party_send_message(
+                    content, retry_on_fail=False
+                )
+            raise
 
     ###################################
     #       Public Key Service        #

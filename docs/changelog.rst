@@ -6,6 +6,38 @@ Changelog
 Detailed version changes.
 You can also view the changelog of the original library, fortnitepy, `here <https://fortnitepy.readthedocs.io/en/latest/changelog.html>`_.
 
+v1.2.0
+------
+
+Ported from `fnbr.js` 4.2.1 through 5.0.1 (18 July 2026 to 19 November 2026).
+
+Added
+~~~~~
+
+- Added ``status_update_interval`` so the client refreshes its status every 10 minutes by default.
+- Added ``xmpp_max_connection_retries``, ``stomp_max_connection_retries``, ``xmpp_connection_retry_backoff`` and ``stomp_connection_retry_backoff``.
+- Added ``restart_on_invalid_refresh``. When enabled, one fresh login is attempted after an invalid refresh token.
+- Party chat now keeps the reportable flag required by the conversation.
+
+Changes
+~~~~~~~
+
+- Friend presences are read from the current EOS payload, including presences that have no activity.
+- ``PresenceParty`` accepts the new party id, app id, build id and flag names, and joins an EOS party when the id is an EOS or lobby id.
+- The client's away status is sent with both the public and the private presence.
+- Cosmetic variant lists ignore channel indexes that are not integers.
+- Ready state updates include ``readyInputType`` and a matchmaking id.
+- Large party member updates are sent in chunks of 32 keys.
+- XMPP and STOMP reconnect with a backoff after a drop, restore the previous party, and log out once the retry limit is exhausted.
+- A failed scheduled token refresh no longer kills the client when ``restart_on_invalid_refresh`` is enabled.
+- Fortnite access is requested before the EULA is accepted.
+
+Bug Fixes
+~~~~~~~~~~
+
+- Fixed device-auth reauthentication dropping the EOS token update.
+- Fixed party messages failing when the party chat requires them to be reportable.
+
 v1.1.0 (pre-release)
 ------
 

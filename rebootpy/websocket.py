@@ -73,6 +73,24 @@ class WebsocketClient:
         self._eas_private_sub_id = None
 
         self.message_history = deque(maxlen=100)
+        self._user_close = False
+        self._reconnect_attempt = 0
+        self._restore_party = False
+        self._session_was_ready = False
+        self._seen_message_order = deque()
+        self._seen_message_ids = set()
+
+    def _duplicate_message(self, message_id: str) -> bool:
+        if not message_id:
+            return False
+        if message_id in self._seen_message_ids:
+            return True
+        self._seen_message_order.append(message_id)
+        self._seen_message_ids.add(message_id)
+        while len(self._seen_message_order) > 200:
+            expired = self._seen_message_order.popleft()
+            self._seen_message_ids.discard(expired)
+        return False
 
     async def set_session(self) -> None:
         self.wss_session = aiohttp.ClientSession()
@@ -169,6 +187,9 @@ class WebsocketClient:
 
             await self.client.send_eos_presence()
             self._ready_event.set()
+            if self._restore_party:
+                self._restore_party = False
+                asyncio.ensure_future(self._restore_party_state())
         elif (
             message_type == 'MESSAGE' and
             isinstance(data.get('type'), str) and
@@ -181,9 +202,18 @@ class WebsocketClient:
             )
         elif (
             message_type == 'MESSAGE' and
+            data.get('type') == 'social.chat.v1.MEMBERS_JOIN'
+        ):
+            asyncio.ensure_future(self._apply_chat_reportable(
+                data.get('payload') or {}
+            ))
+        elif (
+            message_type == 'MESSAGE' and
             data.get('type') == 'social.chat.v1.NEW_MESSAGE' and
             data.get('payload').get('conversation').get('type') == 'dm'
         ):
+            if self._duplicate_message(data.get('id')):
+                return
             author = self.client.get_friend(
                 data['payload']['message']['senderId']
             )
@@ -216,6 +246,8 @@ class WebsocketClient:
             data.get('payload', {}).get('conversation', {}).get('type')
             in ('party', 'epic_party')
         ):
+            if self._duplicate_message(data.get('id')):
+                return
             conversation_type = data['payload']['conversation']['type']
             conversation_id = data['payload']['conversation']['conversationId']  # noqa
             user_id = data['payload']['message']['senderId']
@@ -257,6 +289,10 @@ class WebsocketClient:
             data.get('type') == 'presence.v1.UPDATE'
         ):
             user_id = data['payload']['accountId']
+            if data['payload'].get('status') == 'offline':
+                self.client._presences.pop(user_id, None)
+                return
+
             friend = self.client.get_friend(user_id)
             if friend is None:
                 try:
@@ -301,7 +337,73 @@ class WebsocketClient:
         ):
             asyncio.ensure_future(self.client._epic_party_poll())
 
-    async def connect_to_websocket(self) -> None:
+    async def _apply_chat_reportable(self, payload: dict) -> None:
+        if (
+            getattr(self.client, 'disable_epic_party_service', False)
+            or payload.get('type') != 'epic_party'
+            or payload.get('namespace') != '_'
+            or not isinstance(payload.get('isReportable'), bool)
+        ):
+            return
+
+        lock = getattr(self.client, '_join_party_lock', None)
+        if lock is not None:
+            await lock.wait()
+
+        party = self.client.party
+        conversation_id = payload.get('conversationId')
+        if (
+            party is None
+            or not party.epic_party_id
+            or conversation_id != f'ep-{party.epic_party_id}'
+        ):
+            return
+
+        party.set_reportable(payload['isReportable'], from_chat=True)
+
+    async def _restore_party_state(self) -> None:
+        try:
+            await self.client.recover_party(True)
+            self._reconnect_attempt = 0
+        except Exception as exc:
+            log.debug('STOMP party restore failed: %s', exc)
+            websocket = self.websocket
+            if websocket is not None and not websocket.closed:
+                await websocket.close()
+
+    async def _sleep_before_reconnect(self, had_party: bool) -> bool:
+        limit = getattr(self.client, 'stomp_max_connection_retries', 4)
+        if self._reconnect_attempt >= limit:
+            log.debug('STOMP disconnected, retry limit reached')
+            self.client.loop.create_task(self.client.close())
+            return False
+
+        backoff = getattr(
+            self.client,
+            'stomp_connection_retry_backoff',
+            (5.0, 15.0, 60.0, 600.0),
+        )
+        delay = backoff[min(self._reconnect_attempt, len(backoff) - 1)]
+        self._reconnect_attempt += 1
+        self._restore_party = had_party
+        log.debug('STOMP disconnected, reconnecting in %s seconds', delay)
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return False
+        return not self._user_close
+
+    def _clear_stomp_session(self) -> None:
+        self.heartbeat_started = False
+        self.connection_id = None
+        self.public_connection_id = None
+        self.private_connection_id = None
+        self._eas_public_sub_id = None
+        self._eas_private_sub_id = None
+        self._ready_event.clear()
+
+    async def _connect_once(self) -> bool:
+        established = False
         headers = {
             'Authorization': f'Bearer {self.client.auth.eas_access_token}',
             'Epic-Connect-Protocol': 'stomp',
@@ -324,15 +426,48 @@ class WebsocketClient:
             await websocket.send_str(connect_frame)
 
             async for msg in websocket:
+                if msg.type != aiohttp.WSMsgType.TEXT or msg.data is None:
+                    continue
                 await self.parse_message(msg.data.decode())
+                if self.connection_id is not None:
+                    established = True
+                    self._session_was_ready = True
+        return established
+
+    async def connect_to_websocket(self) -> None:
+        while not self._user_close:
+            established = False
+            try:
+                established = await self._connect_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.debug('STOMP connection error: %s', exc)
+            finally:
+                had_party = self.client.party is not None
+                self._clear_stomp_session()
+
+            if self._user_close:
+                return
+            if not self._session_was_ready and not established:
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    return
+                continue
+            if not await self._sleep_before_reconnect(had_party and established):
+                return
 
     async def run(self) -> None:
         log.debug('Starting STOMP websocket client')
+        self._user_close = False
         self._ready_event.clear()
-        await self.set_session()
-        self.ws_task = self.client.loop.create_task(
-            self.connect_to_websocket()
-        )
+        if self.wss_session is None or self.wss_session.closed:
+            await self.set_session()
+        if self.ws_task is None or self.ws_task.done():
+            self.ws_task = self.client.loop.create_task(
+                self.connect_to_websocket()
+            )
 
         try:
             await asyncio.wait_for(self._ready_event.wait(), timeout=15)
@@ -343,28 +478,42 @@ class WebsocketClient:
 
     async def close(self) -> None:
         log.debug('Closing STOMP websocket client')
-        await self.websocket.close()
-        await self.wss_session.close()
+        self._user_close = True
+        self._restore_party = False
+        websocket = self.websocket
+        if websocket is not None and not websocket.closed:
+            try:
+                await websocket.close()
+            except Exception:
+                pass
+        if self.wss_session is not None and not self.wss_session.closed:
+            await self.wss_session.close()
 
-        self.heartbeat_started = False
-        self.connection_id = None
-        self.public_connection_id = None
-        self.private_connection_id = None
-        self._eas_public_sub_id = None
-        self._eas_private_sub_id = None
-        self._ready_event.clear()
+        task = self.ws_task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self.ws_task = None
+        self._clear_stomp_session()
 
     async def restart(self) -> None:
         log.debug('Restarting STOMP websocket client')
-        await self.close()
-
-        if self.ws_task:
-            self.ws_task.cancel()
+        had_party = self.client.party is not None
+        self._user_close = False
+        self._restore_party = had_party
+        websocket = self.websocket
+        if websocket is not None and not websocket.closed:
+            await websocket.close()
             try:
-                await self.ws_task
-            except asyncio.CancelledError:
-                pass
-            self.ws_task = None
+                await asyncio.wait_for(self._ready_event.wait(), timeout=30)
+            except asyncio.TimeoutError:
+                log.debug('STOMP did not reconnect before the restart wait ended')
+            return
 
+        await self.close()
+        self._user_close = False
+        self._restore_party = had_party
         await self.run()
-        await self.client.rebind_epic_party_connection()
