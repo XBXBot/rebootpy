@@ -186,3 +186,21 @@ def recursive_decode(value: dict) -> dict:
             ]
 
     return duplicate
+
+
+async def websocket_messages(websocket, is_ready, handshake_timeout):
+    """Limit the time spent waiting for the application handshake."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + handshake_timeout
+    messages = websocket.__aiter__()
+    while True:
+        try:
+            if is_ready():
+                message = await messages.__anext__()
+            else:
+                message = await asyncio.wait_for(
+                    messages.__anext__(), deadline - loop.time()
+                )
+        except StopAsyncIteration:
+            return
+        yield message

@@ -7,9 +7,7 @@ be found, it will simply use device code to generate a new file.
 """
 
 import rebootpy
-import asyncio
 import functools
-import os
 import json
 
 instances = {}

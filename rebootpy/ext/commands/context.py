@@ -23,10 +23,13 @@ DEALINGS IN THE SOFTWARE.
 """
 
 
-from typing import Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 from rebootpy.party import ClientParty, PartyMember, ClientPartyMember
 from rebootpy.friend import Friend
 from rebootpy.user import ClientUser
+
+if TYPE_CHECKING:
+    from .cog import Cog
 
 
 class Context:

@@ -29,6 +29,8 @@ import time
 import base64
 import uuid
 import json
+import math
+import re
 
 from aiohttp import BaseConnector
 from typing import (Iterable, Union, Optional, Any, Awaitable, Callable, Dict,
@@ -85,9 +87,9 @@ def _normalize_retry_backoff(name: str, value: Any) -> Tuple[float, ...]:
             raise TypeError(
                 '{0} delays must be numbers of seconds'.format(name)
             )
-        if delay < 0:
+        if not math.isfinite(delay) or delay < 0:
             raise ValueError(
-                '{0} delays must be zero or greater'.format(name)
+                '{0} delays must be finite and zero or greater'.format(name)
             )
         delays.append(float(delay))
     return tuple(delays)
@@ -105,10 +107,16 @@ class StartContext:
             self.client._start(dispatch_ready=self.dispatch_ready)
         )
 
-        await asyncio.wait(
-            (asyncio.create_task(self.client.wait_until_ready()), task),
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+        ready = asyncio.create_task(self.client.wait_until_ready())
+        try:
+            await asyncio.wait((ready, task), return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+        finally:
+            ready.cancel()
+            await asyncio.gather(ready, return_exceptions=True)
 
         return task
 
@@ -554,7 +562,7 @@ class BasicClient:
 
         self._refresh_task = None
         self._start_runner_task = None
-        self._invalid_refresh_recovery = None
+        self._shutdown_task = None
         self._closed = False
         self._closing = False
         self._restarting = False
@@ -722,7 +730,14 @@ class BasicClient:
             self.http.create_connection()
             self._closed = False
 
-        ret = await self._login(priority=pri)
+        try:
+            ret = await self._login(priority=pri)
+        except (Exception, asyncio.CancelledError):
+            try:
+                await self._close(dispatch_close=False, priority=pri)
+            except Exception:
+                log.exception('Failed to clean up after login error')
+            raise
         if ret is False:
             return
 
@@ -740,7 +755,8 @@ class BasicClient:
             except asyncio.CancelledError:
                 pass
             else:
-                raise exc
+                if exc is not None:
+                    raise exc
 
         self._refresh_task = self.loop.create_task(
             self.auth.run_refresh_loop()
@@ -882,54 +898,23 @@ class BasicClient:
             dispatch_close=dispatch_close
         )
 
-    async def recover_from_invalid_refresh(self) -> None:
-        """|coro|
-
-        Attempts one fresh login after a confirmed invalid refresh token.
-        A second failure disconnects the client.
-        """
-        current = self._invalid_refresh_recovery
-        if current is not None and not current.done():
-            await current
-            return
-
-        async def _run() -> None:
-            log.debug(
-                'Refresh token invalid; restarting with configured credentials'
-            )
-            try:
-                await self.auth.reauthenticate(
-                    priority=self._reauth_lock.priority
-                )
-            except NotImplementedError:
-                log.debug(
-                    'Configured credentials cannot refresh this session'
-                )
-                raise
-            except Exception:
-                log.debug('Authentication restart failed; disconnecting')
-                try:
-                    await self.close()
-                except Exception:
-                    log.debug(
-                        'Disconnect failed after authentication restart'
-                    )
-                return
-
-            self.dispatch_event('internal_auth_refresh')
-            self.dispatch_event('auth_refresh')
-
-        task = self.loop.create_task(_run())
-        self._invalid_refresh_recovery = task
-        try:
-            await task
-        finally:
-            if self._invalid_refresh_recovery is task:
-                self._invalid_refresh_recovery = None
-
     def is_closed(self) -> bool:
         """:class:`bool`: Whether the client is running or not."""
         return self._closed
+
+    def _request_close(self) -> None:
+        if self._closing or self._closed or self._shutdown_task is not None:
+            return
+
+        async def shutdown():
+            try:
+                await self.close()
+            except Exception:
+                log.exception('Failed to close the client')
+            finally:
+                self._shutdown_task = None
+
+        self._shutdown_task = self.loop.create_task(shutdown())
 
     def can_restart(self) -> bool:
         return hasattr(self.auth, 'ios_refresh_token')
@@ -2972,6 +2957,10 @@ class Client(BasicClient):
         self.stomp_max_connection_retries = kwargs.get(
             'stomp_max_connection_retries', 4
         )
+        for name in ('xmpp_max_connection_retries', 'stomp_max_connection_retries'):
+            limit = getattr(self, name)
+            if type(limit) is not int or limit < 0:
+                raise ValueError(f'{name} must be a non-negative integer')
         self.xmpp_connection_retry_backoff = _normalize_retry_backoff(
             'xmpp_connection_retry_backoff',
             kwargs.get('xmpp_connection_retry_backoff'),
@@ -2979,10 +2968,6 @@ class Client(BasicClient):
         self.stomp_connection_retry_backoff = _normalize_retry_backoff(
             'stomp_connection_retry_backoff',
             kwargs.get('stomp_connection_retry_backoff'),
-        )
-        self.restart_on_invalid_refresh = kwargs.get(
-            'restart_on_invalid_refresh',
-            self.restart_on_invalid_refresh,
         )
 
         self.supports_non_eg1 = False
@@ -3028,6 +3013,7 @@ class Client(BasicClient):
         self._reconnecting_to_party = False
         self._party_recovery = None
         self._status_update_task = None
+        self._transport_refresh_task = None
 
         self.setup_internal()
 
@@ -3190,24 +3176,19 @@ class Client(BasicClient):
         self._check_party_confirmation()
 
     async def internal_auth_refresh_handler(self):
-        self._reconnecting_to_party = True
+        if self._closing or self._closed or self._transport_refresh_task is not None:
+            return
+        self._transport_refresh_task = asyncio.current_task()
         try:
-            log.debug('Refreshing xmpp session')
-            await self.xmpp._close()
-            await self.xmpp.run()
-
-            log.debug('Refreshing websocket session')
-            await self.websocket.close()
-            await self.websocket.run()
-            await self.rebind_epic_party_connection()
-
-            await asyncio.sleep(2)
-
-            await self._reconnect_to_party()
-        except AttributeError:
-            pass
+            log.debug('Refreshing XMPP and STOMP sessions')
+            await asyncio.gather(self.xmpp.close(), self.websocket.close())
+            await asyncio.gather(self.xmpp.run(), self.websocket.run())
+            await self.recover_party(self.party is not None)
+        except Exception:
+            log.exception('Could not restore connections after token refresh')
+            self._request_close()
         finally:
-            self._reconnecting_to_party = False
+            self._transport_refresh_task = None
 
     async def _start(self, dispatch_ready: bool = True) -> None:
         if self._first_start:
@@ -3225,14 +3206,20 @@ class Client(BasicClient):
 
         self.generate_keypair()
 
-        self.key_data, *_ = await asyncio.gather(
+        tasks = tuple(self.loop.create_task(coro) for coro in (
             self.http.register_public_key(
-                public_key=self.public_key_b64
+                public_key=self.public_key_b64, priority=priority
             ),
             self.refresh_caches(priority=priority),
             self.xmpp.run(),
             self.websocket.run(),
-        )
+        ))
+        try:
+            self.key_data, *_ = await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         # These are here in-case someone just has logging for rebootpy.client
         log.debug('Successfully set up caches')
@@ -3244,6 +3231,8 @@ class Client(BasicClient):
 
         await self.initialize_party(priority=priority)
         log.debug('Party created')
+        if not self._restarting:
+            await self.send_eos_presence()
 
         self.start_epic_party_service()
         self._start_status_updates()
@@ -3264,6 +3253,12 @@ class Client(BasicClient):
 
         self.stop_epic_party_service()
         self._stop_status_updates()
+        if self._transport_refresh_task is not None:
+            self._transport_refresh_task.cancel()
+            await asyncio.gather(self._transport_refresh_task, return_exceptions=True)
+        if self._party_recovery is not None:
+            self._party_recovery.cancel()
+            await asyncio.gather(self._party_recovery, return_exceptions=True)
 
         if self.leave_party_at_shutdown:
             try:
@@ -3421,11 +3416,7 @@ class Client(BasicClient):
         party = self.party
         if party is None:
             return ''
-        try:
-            playlist = party.playlist_info[0]
-        except Exception:
-            return ''
-        return playlist or ''
+        return party.playlist_info[0] or ''
 
     def _presence_is_public(self) -> bool:
         party = self.party
@@ -3475,40 +3466,33 @@ class Client(BasicClient):
         Restores a party that existed before a connection drop.
         Nothing is created when the client was not in a party.
         """
-        if not had_party or self.disable_epic_party_service:
-            return
-
-        current = self._party_recovery
-        if current is not None and not current.done():
-            await current
+        if (
+            not had_party or self._closing or self.party is None
+            or not self.xmpp._ready or not self.websocket.connection_id
+        ):
             return
 
         async def _run() -> None:
-            await self._reconnect_to_party()
-
-        task = self.loop.create_task(_run())
-        self._party_recovery = task
-        try:
-            await task
-        finally:
-            if self._party_recovery is task:
+            try:
+                if self.party.epic_party_id and not self.disable_epic_party_service:
+                    await self.rebind_epic_party_connection()
+                else:
+                    await self._reconnect_to_party()
+            finally:
                 self._party_recovery = None
 
-    async def send_eos_presence(self, raw_status: Optional[dict] = None) -> None:
-        connection_id = self.websocket.connection_id
-        if not connection_id:
-            return
+        if self._party_recovery is None:
+            self._party_recovery = self.loop.create_task(_run())
+        await asyncio.shield(self._party_recovery)
 
-        public_connection_id = self.websocket.public_connection_id or connection_id  # noqa
-        private_connection_id = self.websocket.private_connection_id or connection_id  # noqa
-
+    def _build_eos_presence(self, status: Optional[str] = None) -> dict:
         party_size = self.party.member_count if self.party else 1
-        if raw_status and raw_status.get('Status'):
-            status_value = raw_status['Status']
-        elif self.party:
+        if status is not None:
+            status_value = status
+        elif isinstance(self.status, str):
             status_value = self.status.format(
-                party_size=self.party.member_count,
-                party_max_size=self.party.max_size,
+                party_size=party_size,
+                party_max_size=self.party.max_size if self.party else 1,
                 current_playlist=self.current_status_playlist,
             )
         else:
@@ -3561,6 +3545,16 @@ class Client(BasicClient):
             payload['props']['party.joininfodata.286331153'] = (
                 'm' + json.dumps(join_info)
             )
+        return payload
+
+    async def send_eos_presence(self, raw_status: Optional[dict] = None) -> None:
+        connection_id = self.websocket.connection_id
+        if not connection_id:
+            return
+
+        public_connection_id = self.websocket.public_connection_id or connection_id
+        private_connection_id = self.websocket.private_connection_id or connection_id
+        payload = self._build_eos_presence(raw_status.get('Status') if raw_status else None)
 
         epic_party_id = self.party.epic_party_id if self.party else None
         internal_presence = {
@@ -3700,7 +3694,7 @@ class Client(BasicClient):
         Parameters
         ----------
         epic_party_id: :class:`str`
-            The party id to join.
+            The EOS party ID or the linked Fortnite lobby ID to join.
         """
         connection_id = self.websocket.connection_id
         if not connection_id:
@@ -3714,9 +3708,14 @@ class Client(BasicClient):
         public_connection_id = self._get_public_connection_id(
             connection_id
         )
+        lobby_match = re.fullmatch(r'([0-9a-f]{32})-\d+-default', epic_party_id, re.I)
+        if lobby_match:
+            epic_party_id = lobby_match.group(1)
 
         await self._join_party_lock.acquire()
         try:
+            if self.party is not None and self.party.epic_party_id == epic_party_id:
+                raise PartyError('You are already a member of this party.')
             if self.party is not None:
                 try:
                     await self.http.party_leave(
@@ -3762,15 +3761,23 @@ class Client(BasicClient):
 
             party = self.construct_party(lobby)
             party.epic_party_id = epic_party_id
+            try:
+                epic_party = await self.http.epic_party_get(epic_party_id)
+            except HTTPException as exc:
+                log.debug('Could not fetch EOS party chat settings: %s', exc)
+            else:
+                if isinstance(epic_party.get('is_reportable'), bool):
+                    party.set_reportable(epic_party['is_reportable'])
             await party._update_members(members=lobby['members'])
             self.party = party
         except Exception:
-            self._join_party_lock.release()
-            await self._create_party(acquire=False)
+            if self.party is None:
+                await self._create_party(acquire=False)
             raise
-        else:
+        finally:
             self._join_party_lock.release()
 
+        await self.send_eos_presence()
         return party
 
     async def recreate_party_after_epic_disband(
@@ -3875,9 +3882,11 @@ class Client(BasicClient):
             current = data.get('current') or None
             local_epic_party_id = self.party.epic_party_id if self.party else None  # noqa
 
-            if current and isinstance(current.get('is_reportable'), bool):
-                if self.party is not None:
-                    self.party.set_reportable(current['is_reportable'])
+            if (
+                local_epic_party_id and current and current.get('id') == local_epic_party_id
+                and isinstance(current.get('is_reportable'), bool)
+            ):
+                self.party.set_reportable(current['is_reportable'])
 
             if current and current.get('revision') is not None:
                 try:
@@ -4094,10 +4103,6 @@ class Client(BasicClient):
         await self._create_party(priority=priority)
 
     async def refresh_caches(self, priority: int = 0) -> None:
-        self._friends.clear()
-        self._pending_friends.clear()
-        self._blocked_users.clear()
-
         tasks = (
             self.http.friends_get_all(
                 include_pending=True,
@@ -4128,7 +4133,9 @@ class Client(BasicClient):
             for user in results:
                 users[user['id']] = user
 
-        # TODO: Add method for fetching friends and other stuff
+        self._friends.clear()
+        self._pending_friends.clear()
+        self._blocked_users.clear()
 
         for friend in raw_friends:
             try:
@@ -4473,9 +4480,9 @@ class Client(BasicClient):
                         party_data,
                         event='party_member_reconnect'
                     )
-                except Exception:
+                except Exception as exc:
+                    log.debug('Could not restore the Fortnite party: %s', exc)
                     await self._create_party(acquire=False)
-                    raise
         else:
             await self._create_party()
 
@@ -4780,7 +4787,10 @@ class Client(BasicClient):
 
         self.status = status
         self.away = away
-        self.party.update_presence()
+        if self.party is not None:
+            self.party.update_presence()
+        if self.websocket.connection_id:
+            self.loop.create_task(self.send_eos_presence())
 
     async def send_presence(self, status: Union[str, dict], *,
                             away: AwayStatus = AwayStatus.ONLINE,

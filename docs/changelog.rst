@@ -29,8 +29,9 @@ Changes
 - Ready state updates include ``readyInputType`` and a matchmaking id.
 - Large party member updates are sent in chunks of 32 keys.
 - XMPP and STOMP reconnect with a backoff after a drop, restore the previous party, and log out once the retry limit is exhausted.
-- A failed scheduled token refresh no longer kills the client when ``restart_on_invalid_refresh`` is enabled.
+- With ``restart_on_invalid_refresh`` enabled, a transient scheduled refresh failure is retried after 30 seconds. If a fresh login fails after an invalid refresh token, the client closes.
 - Fortnite access is requested before the EULA is accepted.
+- Installing the package requires Python 3.10 or later, as required by its aiohttp dependency.
 
 Bug Fixes
 ~~~~~~~~~~

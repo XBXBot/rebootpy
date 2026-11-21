@@ -56,6 +56,20 @@ def _parse_presence_value(value):
         return raw
     return value
 
+
+def _presence_int(value):
+    try:
+        return int(value) if isinstance(value, (str, int)) else None
+    except ValueError:
+        return None
+
+
+def _presence_platform(value):
+    try:
+        return Platform(value) if value else None
+    except (ValueError, TypeError):
+        return None
+
 if TYPE_CHECKING:
     from .client import Client
     from .friend import Friend
@@ -195,26 +209,24 @@ class PresenceParty:
         # needs to exist, so we know the party type id is always 286331153
         self.party_type_id = 286331153
 
-        pl = data.get('sP')
-        self.platform = Platform(pl) if pl is not None else None
+        self.platform = _presence_platform(data.get('sP'))
         self.private = data.get('bIsPrivate', False)
-        self.id = data.get('partyId', data.get('p'))
-        self.app_id = data.get('appId', data.get('d'))
-        self.build_id = data.get('buildId', data.get('b'))
+        self.id = data.get('partyId') or data.get('p')
+        self.app_id = data.get('appId') or data.get('d')
+        self.build_id = data.get('buildId') or data.get('b')
 
-        if self.build_id is not None and self.build_id.startswith('1:3:'):
+        if isinstance(self.build_id, str) and self.build_id.startswith('1:3:'):
             self.net_cl = self.build_id[4:]
         else:
             self.net_cl = None
 
-        self.party_flags = data.get('partyFlags', data.get('f'))
-        self.not_accepting_reason = data.get(
-            'notAcceptingReason', data.get('nAR')
-        )
-
-        self.playercount = data.get('pc')
-        if self.playercount is not None:
-            self.playercount = int(self.playercount)
+        self.party_flags = data.get('partyFlags')
+        if self.party_flags is None:
+            self.party_flags = data.get('f')
+        self.not_accepting_reason = data.get('notAcceptingReason')
+        if self.not_accepting_reason is None:
+            self.not_accepting_reason = data.get('nAR')
+        self.playercount = _presence_int(data.get('pc'))
 
     def __repr__(self) -> str:
         return ('<PresenceParty private={0.private} id={0.id!r} '
@@ -245,20 +257,15 @@ class PresenceParty:
         ):
             raise PartyError('You are already a member of this party.')
 
-        if self.private:
+        if self.private or not isinstance(self.id, str) or not self.id:
             raise Forbidden('You cannot join a private party.')
 
-        party_id = self.id or ''
-        if re.fullmatch(r'[0-9a-fA-F]{32}', party_id):
-            return await self.client.join_party(party_id)
+        if not self.client.disable_epic_party_service and re.fullmatch(
+            r'[0-9a-fA-F]{32}(?:-\d+-default)?', self.id
+        ):
+            return await self.client.join_party(self.id)
 
-        lobby = re.fullmatch(
-            r'([0-9a-fA-F]{32})-\d+-[A-Za-z0-9_-]+', party_id
-        )
-        if lobby:
-            return await self.client.join_party(lobby.group(1))
-
-        return await self.client.join_legacy_party(party_id)
+        return await self.client.join_legacy_party(self.id)
 
 
 class Presence:
@@ -329,8 +336,9 @@ class Presence:
         raw: dict
     ) -> None:
         self.client = client
-        from_id = raw.get('accountId') if isinstance(raw, dict) else None
-        per_ns = raw.get('perNs') if isinstance(raw, dict) else None
+        raw = raw if isinstance(raw, dict) else {}
+        from_id = raw.get('accountId')
+        per_ns = raw.get('perNs')
         if not isinstance(per_ns, list) or not per_ns:
             data = {}
         else:
@@ -347,21 +355,17 @@ class Presence:
 
         self.friend = self.client.get_friend(from_id) if from_id else None
         self.received_at = datetime.datetime.utcnow()
-        online_type = raw.get('status') if isinstance(raw, dict) else None
-        if online_type is None and isinstance(data, dict):
-            online_type = data.get('status')
-        self.away = AwayStatus.AWAY if online_type == 'away' \
-            else AwayStatus.ONLINE
+        online_type = raw.get('status') or data.get('status')
+        self.away = {
+            'away': AwayStatus.AWAY, 'xa': AwayStatus.EXTENDED_AWAY
+        }.get(online_type, AwayStatus.ONLINE)
 
-        activity = data.get('activity') if isinstance(data, dict) else None
-        if isinstance(activity, dict):
-            self.status = activity.get('value')
-        elif isinstance(data, dict):
+        activity = data.get('activity')
+        self.status = activity.get('value') if isinstance(activity, dict) else None
+        if 'activity' not in data and data.get('status') not in ('online', 'away', 'xa', 'offline', 'dnd'):
             self.status = data.get('status')
-        else:
-            self.status = None
 
-        props = data.get('props') if isinstance(data, dict) else None
+        props = data.get('props')
         if not isinstance(props, dict):
             props = {}
 
@@ -375,11 +379,7 @@ class Presence:
 
         self.has_properties = props != {}
 
-        platform_value = prop('EOS_Platform')
-        try:
-            self.platform = Platform(platform_value) if platform_value else None
-        except ValueError:
-            self.platform = None
+        self.platform = _presence_platform(prop('EOS_Platform'))
 
         self.session_id = prop('SessionIdAttributeKey') or None
 
@@ -388,8 +388,8 @@ class Presence:
             basic_info = {}
         self.homebase_rating = basic_info.get('homeBaseRating')
 
-        lfg = prop('FortLFG')
-        self.lfg = None if lfg is None else int(lfg) == 1
+        lfg = _presence_int(prop('FortLFG'))
+        self.lfg = None if lfg is None else lfg == 1
 
         self.sub_game = prop('FortSubGame')
 
@@ -404,30 +404,19 @@ class Presence:
         self.playlist = prop('GamePlaylistName')
         self.island_code = prop('IslandCode')
 
-        players_alive = prop('Event_PlayersAlive')
-        if isinstance(players_alive, str) and players_alive.isdigit():
-            players_alive = int(players_alive)
-
-        self.party_size = prop('FortPartySize')
+        players_alive = _presence_int(prop('Event_PlayersAlive'))
+        self.party_size = _presence_int(prop('FortPartySize'))
         if self.party_size is None:
-            self.party_size = prop('Event_PartySize')
-        if isinstance(self.party_size, str) and str(self.party_size).isdigit():
-            self.party_size = int(self.party_size)
-
-        self.max_party_size = prop('Event_PartyMaxSize')
-        if isinstance(self.max_party_size, str) and str(self.max_party_size).isdigit():
-            self.max_party_size = int(self.max_party_size)
-
-        self.server_player_count = prop('ServerPlayerCount')
-        if isinstance(self.server_player_count, str) and str(self.server_player_count).isdigit():
-            self.server_player_count = int(self.server_player_count)
+            self.party_size = _presence_int(prop('Event_PartySize'))
+        self.max_party_size = _presence_int(prop('Event_PartyMaxSize'))
+        self.server_player_count = _presence_int(prop('ServerPlayerCount'))
 
         gameplay = prop('FortGameplayStats')
         if isinstance(gameplay, dict):
             self.gameplay_stats = PresenceGameplayStats(
                 self.friend,
                 gameplay,
-                players_alive if isinstance(players_alive, int) else None,
+                players_alive,
                 self.playlist
             )
         else:
@@ -443,7 +432,7 @@ class Presence:
                 self.client,
                 party_data
             )
-            self.joinable = not self.party.private
+            self.joinable = bool(self.party.id) and not self.party.private
 
     def __repr__(self) -> str:
         return (

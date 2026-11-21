@@ -32,14 +32,15 @@ import time
 import webbrowser
 import secrets
 import base64
+import aiohttp
 
 from random import randint
 from aioconsole import ainput
 from typing import TYPE_CHECKING, Optional, Any, List
 
-from .errors import AuthException, HTTPException
+from .errors import AuthException, HTTPException, _RefreshRecoveryFailed
 from .typedefs import StrOrMaybeCoro
-from .utils import from_iso, to_iso
+from .utils import from_iso
 
 if TYPE_CHECKING:
     from .client import BasicClient
@@ -304,40 +305,47 @@ class Auth:
         await asyncio.sleep(self.token_timeout)
 
     async def run_refresh_loop(self) -> None:
-        loop = self.client.loop
-
         while True:
-            self._refresh_event.clear()
-            _, p = await asyncio.wait((
-                loop.create_task(self._refresh_event.wait()),
-                loop.create_task(self.schedule_token_refresh())
-            ), return_when=asyncio.FIRST_COMPLETED)
+            await self._wait_for_refresh()
+            while True:
+                try:
+                    await self.do_refresh()
+                except _RefreshRecoveryFailed:
+                    await self.client._closed_event.wait()
+                    return
+                except (HTTPException, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    transient = not isinstance(exc, HTTPException) or exc.status == 429 or exc.status >= 500
+                    if not self.client.restart_on_invalid_refresh or not transient:
+                        raise
+                    log.debug('Scheduled session refresh failed: %s', exc)
+                    await asyncio.sleep(30)
+                else:
+                    break
 
-            for pending in p:
-                if not pending.cancelled():
-                    pending.cancel()
-
-            try:
-                await self.do_refresh()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                if not getattr(
-                    self.client, 'restart_on_invalid_refresh', False
-                ):
-                    raise
-                log.debug('Scheduled session refresh failed: %s', exc)
-                await asyncio.sleep(30)
+    async def _wait_for_refresh(self) -> None:
+        self._refresh_event.clear()
+        tasks = (
+            self.client.loop.create_task(self._refresh_event.wait()),
+            self.client.loop.create_task(self.schedule_token_refresh()),
+        )
+        try:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                task.result()
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def do_refresh(self) -> None:
         reauth_lock = self.client._reauth_lock
         reauth_lock.priority += 1
         forced = reauth_lock.locked()
 
-        try:
-            if not forced:
-                await self._refresh_lock.acquire()
+        if not forced:
+            await self._refresh_lock.acquire()
 
+        try:
             log.debug('Refreshing session')
             self.client._refresh_times.append(time.time())
 
@@ -360,47 +368,47 @@ class Auth:
                     priority=reauth_lock.priority
                 )
                 self._update_eos_data(data)
-            except (HTTPException, AttributeError) as exc:
+            except HTTPException as exc:
                 m = 'errors.com.epicgames.account.auth_token.' \
                     'invalid_refresh_token'
                 invalid_grant = (
-                    isinstance(exc, HTTPException)
-                    and isinstance(getattr(exc, 'raw', None), dict)
+                    exc.status == 400 and isinstance(exc.raw, dict)
                     and exc.raw.get('error') == 'invalid_grant'
                 )
-                if (
-                    isinstance(exc, HTTPException)
-                    and exc.message_code != m
-                    and not invalid_grant
-                ):
+                invalid_refresh = exc.status in (400, 401) and exc.message_code == m
+                if not (invalid_refresh or invalid_grant):
                     raise
-
-                if (
-                    getattr(self.client, 'restart_on_invalid_refresh', False)
-                    and self.client.is_ready()
-                ):
-                    log.debug(
-                        'Invalid refresh token was supplied. Attempting one '
-                        'fresh login.'
-                    )
-                    await self.client.recover_from_invalid_refresh()
-                    self.refresh_i += 1
-                    return
 
                 log.debug(
                     'Invalid refresh token was supplied. Attempting to '
                     'reconnect if possible.'
                 )
+                disconnect_on_failure = (
+                    self.client.restart_on_invalid_refresh and self.client.is_ready()
+                )
                 try:
                     await self.reauthenticate(
                         priority=reauth_lock.priority
                     )
-                except NotImplementedError:
-                    raise exc
+                except Exception as error:
+                    if disconnect_on_failure:
+                        log.debug('Authentication restart failed: %s', error)
+                        self.client._request_close()
+                        raise _RefreshRecoveryFailed(
+                            'Could not log in after the refresh token expired.', error
+                        ) from error
+                    if isinstance(error, NotImplementedError):
+                        raise exc from error
+                    raise
 
                 log.debug('Successfully reauthenticated.')
 
-            await self.client.dispatch_and_wait_event('internal_auth_refresh')
+            if forced:
+                # HTTP recovery holds the reauthentication lock. Reopening
+                # the transports uses HTTP and can run once that lock is free.
+                self.client.dispatch_event('internal_auth_refresh')
+            else:
+                await self.client.dispatch_and_wait_event('internal_auth_refresh')
 
             self.refresh_i += 1
             log.debug('Sessions was successfully refreshed.')

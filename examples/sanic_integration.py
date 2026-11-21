@@ -4,7 +4,6 @@ web framework sanic.
 
 import rebootpy
 import json
-import os
 import sanic
 
 from rebootpy.ext import commands
@@ -29,11 +28,6 @@ bot = commands.Bot(
 
 sanic_app = sanic.Sanic(__name__)
 server = None
-
-
-@bot.event
-async def event_device_auth_generate(details, email):
-    store_device_auth_details(email, details)
 
 
 @sanic_app.route('/friends', methods=['GET'])

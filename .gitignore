@@ -105,9 +105,9 @@ venv.bak/
 .mypy_cache/
 
 .vscode
-tests/
 exttest/
-test*
+/test*
+!/tests/
 __ignore*
 voice.py
 output.txt

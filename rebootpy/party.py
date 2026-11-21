@@ -34,8 +34,17 @@ from typing import (TYPE_CHECKING, Iterable, Optional, Any, List, Dict, Union,
                     Tuple, Awaitable, Type)
 from collections import OrderedDict
 
-from .enums import Enum, Region
+from .enums import Enum
 from .errors import PartyError, Forbidden, HTTPException
+from .user import User
+from .friend import Friend
+from .enums import (PartyPrivacy, PartyDiscoverability, PartyJoinability,
+                    DefaultCharactersChapter3, Region, ReadyState, Platform)
+from .utils import MaybeLock, to_iso, from_iso
+from .stw import fort_mappings
+
+if TYPE_CHECKING:
+    from .client import Client
 
 
 def _variant_channels(variants):
@@ -48,18 +57,16 @@ def _variant_channels(variants):
     if not isinstance(variants, list) or not variants:
         return [] if variants is None else variants
 
-    indexed = []
-    for variant in variants:
-        if not isinstance(variant, dict):
-            return variants
-        if 'channelIndex' in variant or 'channel_index' in variant:
-            indexed.append(variant)
-        else:
-            return variants
+    if not any(isinstance(variant, dict) and (
+        'channelIndex' in variant or 'channel_index' in variant
+    ) for variant in variants):
+        return variants
 
     highest = -1
     parsed = []
-    for variant in indexed:
+    for variant in variants:
+        if not isinstance(variant, dict):
+            continue
         channel = variant.get('channelIndex', variant.get('channel_index'))
         if isinstance(channel, bool) or not isinstance(channel, int):
             continue
@@ -74,15 +81,6 @@ def _variant_channels(variants):
     for channel, value in parsed:
         channels[channel] = value
     return channels
-from .user import User
-from .friend import Friend
-from .enums import (PartyPrivacy, PartyDiscoverability, PartyJoinability,
-                    DefaultCharactersChapter3, Region, ReadyState, Platform)
-from .utils import MaybeLock, to_iso, from_iso
-from .stw import fort_mappings
-
-if TYPE_CHECKING:
-    from .client import Client
 
 
 class SquadAssignment:
@@ -427,40 +425,35 @@ class Patchable:
         async with self.patch_lock:
             try:
                 await self.meta.meta_ready_event.wait()
-                while True:
-                    try:
-                        # If no updated is passed then just select the first
-                        # value to "update" as fortnite returns an error if
-                        # the update meta is empty.
-                        max_ = kwargs.pop('max', 1)
-                        _updated = updated or self.meta.get_schema(max=max_)
-                        _deleted = deleted or []
+                max_ = kwargs.pop('max', 1)
+                _updated = dict(updated or self.meta.get_schema(max=max_))
+                _deleted = deleted or []
+                for key in _deleted:
+                    _updated.pop(key, None)
 
-                        for val in _deleted:
-                            try:
-                                del _updated[val]
-                            except KeyError:
-                                pass
-
-                        await self.do_patch(
-                            updated=_updated,
-                            deleted=_deleted,
-                            **kwargs
-                        )
-                        if not getattr(self, '_suppress_revision_bump', False):
-                            self.revision += 1
-                        else:
-                            self._suppress_revision_bump = False
-                        return updated, deleted
-                    except HTTPException as exc:
-                        m = 'errors.com.epicgames.social.party.stale_revision'
-                        if exc.message_code == m:
-                            self.revision = int(exc.message_vars[1])
-                            continue
-
-                        raise
+                await self.do_patch(updated=_updated, deleted=_deleted, **kwargs)
+                return updated, deleted
             finally:
                 self._config_cache = {}
+
+    async def _send_patch(self, send, **kwargs) -> None:
+        for attempt in range(3):
+            revision = self.revision
+            try:
+                await send(revision=revision, **kwargs)
+            except HTTPException as exc:
+                if (
+                    exc.message_code != 'errors.com.epicgames.social.party.stale_revision'
+                    or attempt == 2
+                ):
+                    raise
+                try:
+                    self.revision = int(exc.message_vars[1])
+                except (IndexError, TypeError, ValueError):
+                    raise exc from None
+            else:
+                self.revision = max(self.revision, revision + 1)
+                return
 
     async def _edit(self,
                     *coros: List[Union[Awaitable, functools.partial]]) -> None:
@@ -2516,38 +2509,22 @@ class ClientPartyMember(PartyMemberBase, Patchable):
                 key: value for key, value in updated.items()
                 if key.startswith('Default:')
             }
+            deleted = [key for key in deleted or [] if key.startswith('Default:')]
 
         items = list(updated.items())
         deleted = list(deleted or [])
         if not items and not deleted:
-            self._suppress_revision_bump = True
             return
 
-        chunks = [
-            dict(items[index:index + 32])
-            for index in range(0, max(len(items), 1), 32)
-        ]
-        for index, chunk in enumerate(chunks):
-            while True:
-                try:
-                    await self.client.http.party_update_member_meta(
-                        party_id=self.party.id,
-                        user_id=self.id,
-                        updated_meta=chunk,
-                        deleted_meta=deleted if index == 0 else [],
-                        revision=self.revision,
-                        **kwargs
-                    )
-                    break
-                except HTTPException as exc:
-                    if exc.message_code != (
-                        'errors.com.epicgames.social.party.stale_revision'
-                    ):
-                        raise
-                    self.revision = int(exc.message_vars[1])
-
-            if index < len(chunks) - 1:
-                self.revision += 1
+        for start in range(0, max(len(items), 1), 32):
+            await self._send_patch(
+                self.client.http.party_update_member_meta,
+                party_id=self.party.id,
+                user_id=self.id,
+                updated_meta=dict(items[start:start + 32]),
+                deleted_meta=deleted if start == 0 else [],
+                **kwargs,
+            )
 
     def update_meta_config(self, data: dict, **kwargs) -> None:
         # In case the default party member config has been overridden, the
@@ -3856,7 +3833,7 @@ class PartyBase:
 
         self._update_invites(data.get('invites', []))
         self._update_config(data.get('config'))
-        self.meta = PartyMeta(self, data['meta'])
+        self.meta = PartyMeta(self, data.get('meta'))
 
     def __str__(self) -> str:
         return self.id
@@ -4084,13 +4061,16 @@ class PartyBase:
     def _update_invites(self, invites: list) -> None:
         self.invites = invites
 
-    def _update_config(self, config: dict = {}) -> None:
+    def _update_config(self, config: Optional[dict] = None) -> None:
+        config = dict(config or {})
+        if 'invite_ttl_seconds' not in config and 'invite_ttl' in config:
+            config['invite_ttl_seconds'] = config['invite_ttl']
+        config = {**self.client.default_party_config.config, **config}
         self.join_confirmation = config['join_confirmation']
         self.max_size = config['max_size']
-        self.invite_ttl_seconds = config.get('invite_ttl_seconds',
-                                             config['invite_ttl'])
+        self.invite_ttl_seconds = config['invite_ttl_seconds']
         self.sub_type = config['sub_type']
-        self.config = {**self.client.default_party_config.config, **config}
+        self.config = config
 
     async def _update_members(self, members: Optional[list] = None,
                               remove_missing: bool = True,
@@ -4423,16 +4403,16 @@ class ClientParty(PartyBase, Patchable):
             Content is longer than 256 characters or the client is in a party
             on its own.
         """
-        await self.client.http.party_send_message(content)
+        await self.client.http.party_send_message(content, party=self)
 
     async def do_patch(self, updated: Optional[dict] = None,
                        deleted: Optional[list] = None,
                        **kwargs) -> None:
-        await self.client.http.party_update_meta(
+        await self._send_patch(
+            self.client.http.party_update_meta,
             party_id=self.id,
             updated_meta=updated,
             deleted_meta=deleted,
-            revision=self.revision,
             **kwargs
         )
 

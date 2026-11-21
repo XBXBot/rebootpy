@@ -36,13 +36,11 @@ import base64
 
 from xml.etree import ElementTree
 from collections import defaultdict
-from typing import TYPE_CHECKING, Optional, Union, Awaitable, Any, Tuple
-from .errors import HTTPException
+from typing import TYPE_CHECKING, Optional, Union, Awaitable
+from .errors import HTTPException, XMPPError
 from .party import (Party, PartyJoinRequest, ReceivedPartyInvitation,
                     PartyJoinConfirmation)
-from .presence import Presence
-from .enums import AwayStatus
-from .utils import to_iso, from_iso
+from .utils import to_iso, from_iso, websocket_messages
 
 if TYPE_CHECKING:
     from .client import Client
@@ -234,6 +232,8 @@ class XMLProcessor:
 
 
 class XMPPClient:
+    _handshake_timeout = 15
+
     def __init__(self, client: 'Client', ws_connector=None) -> None:
         self.client = client
         # self.ws_connector = ws_connector
@@ -253,6 +253,7 @@ class XMPPClient:
         self._reconnect_attempt = 0
         self._restore_party = False
         self._ever_ready = False
+        self._restore_task = None
 
         self.send_presence_on_add = True
 
@@ -1192,20 +1193,21 @@ class XMPPClient:
             await asyncio.sleep(5)
 
     async def xmpp_send(self, data: str) -> None:
-        if self.websocket.closed:
+        websocket = self.websocket
+        if websocket is None or websocket.closed:
             raise ConnectionError("Attempted to write to closed websocket.")
 
         try:
             await asyncio.wait_for(
-                self.websocket.send_str(data),
+                websocket.send_str(data),
                 timeout=5.0
             )
         except asyncio.TimeoutError:
             log.debug('XMPP send timed out, restarting now...')
-            await self.restart()
+            await websocket.close()
         except aiohttp.client_exceptions.ClientConnectionResetError:
             log.debug('Disconnected from websocket, restarting now...')
-            await self.restart()
+            await websocket.close()
         except Exception as e:
             log.debug(f'Unknown XMPP send error: {e}')
             raise
@@ -1261,15 +1263,17 @@ class XMPPClient:
             )
 
             self._ready = True
+            self._last_pong = datetime.datetime.now(datetime.timezone.utc)
+            if self._ever_ready:
+                self._restore_task = self.client.loop.create_task(
+                    self._restore_connection(self.websocket)
+                )
             self._ever_ready = True
             self._xmpp_ready_event.set()
-            if self._restore_party:
-                self._restore_party = False
-                self.client.loop.create_task(self._restore_party_state())
         elif 'type="result"' in raw and 'id="ping"' in raw:
             self._last_pong = datetime.datetime.now(datetime.timezone.utc)
             self.client.dispatch_event('internal_xmpp_session_pong')
-            log.debug(f'Received XMPP pong')
+            log.debug('Received XMPP pong')
         else:
             ret = self.xml_processor.process(raw)
 
@@ -1286,7 +1290,7 @@ class XMPPClient:
                 if type_ == "message":
                     EventDispatcher.process_event(self.client, *ret[1])
                 else:
-                    log(f"Unhandled XML type: {type_}")
+                    log.debug('Unhandled XML type: %s', type_)
 
     async def presence_manager(self) -> None:
         stanza = ""
@@ -1297,21 +1301,24 @@ class XMPPClient:
                 stanza = self.stanza
             await asyncio.sleep(1)
 
-    async def _restore_party_state(self) -> None:
+    async def _restore_connection(self, websocket) -> None:
         try:
-            await self.client.recover_party(True)
-            self._reconnect_attempt = 0
+            await self.client.refresh_caches()
+            if self._restore_party:
+                await self.client.recover_party(True)
+            if not websocket.closed:
+                self._restore_party = False
+                self._reconnect_attempt = 0
         except Exception as exc:
-            log.debug('XMPP party restore failed: %s', exc)
-            websocket = self.websocket
-            if websocket is not None and not websocket.closed:
+            log.debug('XMPP connection restore failed: %s', exc)
+            if not websocket.closed:
                 await websocket.close()
 
     async def _sleep_before_reconnect(self, had_party: bool) -> bool:
         limit = getattr(self.client, 'xmpp_max_connection_retries', 4)
         if self._reconnect_attempt >= limit:
             log.debug('XMPP disconnected, retry limit reached')
-            self.client.loop.create_task(self.client.close())
+            self.client._request_close()
             return False
 
         backoff = getattr(
@@ -1321,7 +1328,7 @@ class XMPPClient:
         )
         delay = backoff[min(self._reconnect_attempt, len(backoff) - 1)]
         self._reconnect_attempt += 1
-        self._restore_party = had_party
+        self._restore_party = self._restore_party or had_party
         log.debug('XMPP disconnected, reconnecting in %s seconds', delay)
         try:
             await asyncio.sleep(delay)
@@ -1332,7 +1339,6 @@ class XMPPClient:
     async def connect_to_xmpp(self) -> None:
         log.debug('Attempting to connect to XMPP...')
         while not self._user_close:
-            established = False
             try:
                 async with self.http_session.ws_connect(
                     "wss://xmpp-service-prod.ol.epicgames.com",
@@ -1348,11 +1354,12 @@ class XMPPClient:
                         "<open xmlns='urn:ietf:params:xml:ns:xmpp-framing' to='prod.ol.epicgames.com' version='1.0' />"
                     )
 
-                    async for msg in websocket:
+                    async for msg in websocket_messages(
+                        websocket, self._xmpp_ready_event.is_set,
+                        self._handshake_timeout
+                    ):
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             await self.parse_message(msg.data)
-                            if self._ready:
-                                established = True
             except aiohttp.client_exceptions.ClientConnectorDNSError:
                 log.debug(
                     'DNS error when attempting to connect to XMPP'
@@ -1363,10 +1370,8 @@ class XMPPClient:
             except Exception as exc:
                 log.debug('XMPP connection error: %s', exc)
             finally:
-                had_party = (
-                    getattr(self.client, 'party', None) is not None
-                )
-                await self._close(close_http=False, cancel_task=False)
+                had_party = self._ready and self.client.party is not None
+                await self._clear_connection()
 
             if self._user_close:
                 return
@@ -1376,30 +1381,30 @@ class XMPPClient:
                 except asyncio.CancelledError:
                     return
                 continue
-            if not await self._sleep_before_reconnect(
-                had_party and established
-            ):
+            if not await self._sleep_before_reconnect(had_party):
                 return
 
     async def run(self) -> None:
-        if self._xmpp_task and not self._xmpp_task.done():
-            return
-
-        self._user_close = False
-        self.http_session = aiohttp.ClientSession()
-        self._xmpp_task = self.client.loop.create_task(self.connect_to_xmpp())
-
-        await self._xmpp_ready_event.wait()
+        if self._xmpp_task is None or self._xmpp_task.done():
+            self._user_close = False
+            if self.http_session is None or self.http_session.closed:
+                self.http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(
+                    sock_connect=self._handshake_timeout, sock_read=self._handshake_timeout
+                ))
+            self._xmpp_task = self.client.loop.create_task(self.connect_to_xmpp())
+        try:
+            await asyncio.wait_for(
+                self._xmpp_ready_event.wait(), self._handshake_timeout
+            )
+        except asyncio.TimeoutError:
+            await self.close()
+            raise XMPPError('Timed out connecting to XMPP') from None
 
     async def close(self) -> None:
         self._user_close = True
         self._restore_party = False
-        websocket = self.websocket
-        if websocket is not None and not websocket.closed:
-            try:
-                await websocket.close()
-            except Exception:
-                pass
+        self._ever_ready = False
+        self._reconnect_attempt = 0
 
         task = self._xmpp_task
         if task is not None and not task.done():
@@ -1408,15 +1413,17 @@ class XMPPClient:
                 await task
             except asyncio.CancelledError:
                 pass
-        await self._close(close_http=True, cancel_task=False)
+        self._xmpp_task = None
+        await self._clear_connection()
+        if self.http_session is not None:
+            await self.http_session.close()
+            self.http_session = None
 
     async def restart(self) -> None:
         if self._restarting or self._user_close:
             return
 
         self._restarting = True
-        had_party = getattr(self.client, 'party', None) is not None
-        self._restore_party = had_party
         log.debug('Reconnecting to XMPP...')
 
         try:
@@ -1424,60 +1431,38 @@ class XMPPClient:
             if websocket is not None and not websocket.closed:
                 self._xmpp_ready_event.clear()
                 await websocket.close()
-                await self._xmpp_ready_event.wait()
-            else:
-                await self.close()
-                self._user_close = False
-                self._restore_party = had_party
-                await self.run()
+            await asyncio.wait_for(
+                self._xmpp_ready_event.wait(), self._handshake_timeout
+            )
+        except asyncio.TimeoutError:
+            raise XMPPError('Timed out reconnecting to XMPP') from None
         finally:
             self._restarting = False
 
-    async def _close(self, close_http: bool = True,
-                     cancel_task: bool = True) -> None:
-        log.debug('Attempting to close xmpp client')
-
+    async def _clear_connection(self) -> None:
+        had_connection = self.websocket is not None
         self._ready = False
         self._connected = False
         self._authed = False
         self._bound = False
+        self._last_pong = None
         self._xmpp_ready_event.clear()
 
-        tasks = [
-            self._presence_task,
-            self._ping_task,
-            self._watchdog_task,
-        ]
-        if cancel_task:
-            tasks.append(self._xmpp_task)
+        tasks = [task for task in (
+            self._presence_task, self._ping_task, self._watchdog_task,
+            self._restore_task,
+        ) if task is not None]
         for task in tasks:
-            if task:
-                task.cancel()
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
         self._presence_task = None
         self._ping_task = None
         self._watchdog_task = None
-        if cancel_task:
-            self._xmpp_task = None
-
-        if self.websocket is not None and not self.websocket.closed:
-            try:
-                await asyncio.wait_for(self.websocket.close(), timeout=1.0)
-            except Exception:
-                pass
-
+        self._restore_task = None
         self.websocket = None
-
-        if self.http_session and close_http:
-            await self.http_session.close()
-
-            self.http_session = None
-
-        # # let loop run one iteration for events to be dispatched
-        # await asyncio.sleep(0)
-
-        self.client.dispatch_event('xmpp_session_close')
-        log.debug('Successfully closed xmpp client')
+        if had_connection:
+            self.client.dispatch_event('xmpp_session_close')
 
 
     def set_presence(self, *,

@@ -30,14 +30,13 @@ import re
 import time
 import functools
 import datetime
-import base64
 import uuid
 
 from typing import TYPE_CHECKING, Iterable, List, Optional, Any, Union, Tuple
 from urllib.parse import quote as urllibquote
 
 from .utils import MaybeLock, to_iso
-from .errors import HTTPException, ChatError
+from .errors import HTTPException, ChatError, _RefreshRecoveryFailed
 
 if TYPE_CHECKING:
     from .client import Client
@@ -735,6 +734,8 @@ class HTTPClient:
                             if should_force():
                                 try:
                                     await self.client.auth.do_refresh()
+                                except _RefreshRecoveryFailed:
+                                    raise
                                 except asyncio.CancelledError:
                                     lock.failed = True
                                     retry = False
@@ -1467,11 +1468,11 @@ class HTTPClient:
             'id': str(self.client.xmpp.local_jid)
         }
         r = PartyService(
-            'party/api/v1/Fortnite/parties/{party_id}/members/{user_id}/disconnect',  # noqa
+            '/party/api/v1/Fortnite/parties/{party_id}/members/{user_id}/disconnect',  # noqa
             party_id=party_id,
             user_id=user_id,
         )
-        return await self.post(r,)
+        return await self.post(r, json=payload)
 
     async def party_send_invite(self, party_id: str,
                                 user_id: str,
@@ -1861,6 +1862,12 @@ class HTTPClient:
             **kwargs
         )
 
+    async def epic_party_get(self, party_id: str, **kwargs: Any) -> dict:
+        route = ChatService(
+            '/epic/party/internal/v2/parties/{party_id}', party_id=party_id
+        )
+        return await self.get(route, auth='EAS_ACCESS_TOKEN', **kwargs)
+
     async def epic_party_send_invite(self, friend_id: str,
                                     **kwargs: Any) -> Any:
         payload = {
@@ -1997,101 +2004,7 @@ class HTTPClient:
                                  status: str = None,
                                  **kwargs: Any
                                  ) -> Any:
-        if not self.client.party:
-            payload = {
-                "status": self.client._presence_online_type(),
-                "props": {
-                    "EOS_Platform": self.client.platform.value,
-                    "EOS_IntegratedPlatform": "EGS",
-                    "EOS_OnlinePlatformType": "100",
-                    "EOS_ProductVersion": self.client.build,
-                    "EOS_ProductName": "Fortnite",
-                    "EOS_Session": "{\"version\":3}",
-                    "EOS_Lobby": "{\"version\":3}"
-                },
-                "conn": {
-                    "props": {}
-                }
-            }
-        else:
-            raw_status = status or self.client.status
-            formatted_status = raw_status.format(
-                party_size=self.client.party.member_count,
-                party_max_size=self.client.party.max_size,
-                current_playlist=self.client.current_status_playlist
-            )
-
-            payload = {
-                "status": self.client._presence_online_type(),
-                "activity": {
-                    "value": formatted_status
-                },
-                "props": {
-                    "FortBasicInfo": f"m{json.dumps(
-                        {
-                            "homeBaseRating": 0
-                        }
-                    )}",
-                    "FortLFG": "i0",
-                    "FortPartySize": f"i{self.client.party.member_count}",
-                    "FortSubGame": "i1",
-                    "IslandCode": f"s{self.client.party.playlist_info[0]}",
-                    "IsInZone": "bfalse",
-                    "FortGameplayStats": f"m{json.dumps(
-                        {
-                            "state": "",
-                            "playlist": "None",
-                            "numKills": 0,
-                            "bFellToDeath": False
-                        }
-                    )}",
-                    "SocialStatus": f"m{json.dumps(
-                        {
-                            "attendingSocialEventIds": []
-                        }
-                    )}",
-                    "InUnjoinableMatch": "bfalse",
-                    "EOS_Platform": self.client.platform.value,
-                    "EOS_IntegratedPlatform": "EGS",
-                    "EOS_OnlinePlatformType": "100",
-                    "EOS_ProductVersion": self.client.build,
-                    "EOS_ProductName": "Fortnite",
-                    "EOS_Session": json.dumps(
-                        {
-                            "version": 3
-                        }
-                    ),
-                    "EOS_Lobby": json.dumps(
-                        {
-                            "version": 3
-                        }
-                    )
-                },
-                "conn": {
-                    "props": {}
-                }
-            }
-
-            perm = self.client.party.config['privacy'][
-                'presencePermission'
-            ]
-            me = getattr(self.client.party, 'me', None)
-            is_leader = me is not None and me.leader
-            if perm == 'Anyone' or (perm == 'Leader' and is_leader):
-                payload["props"][
-                    "party.joininfodata.286331153"
-                ] = f"m{json.dumps(
-                    {
-                        "sDN": self.client.user.display_name,
-                        "sP": self.client.platform.value,
-                        "p": self.client.party.id,
-                        "d": "Fortnite",
-                        "b": self.client.party_build_id,
-                        "f": 6,
-                        "nAR": 0,
-                        "pc": self.client.party.member_count
-                    }
-                )}"
+        payload = self.client._build_eos_presence(status)
 
         r = ChatService(
             '/epic/presence/v1/{deployment_id}/{account_id}/'
@@ -2206,15 +2119,18 @@ class HTTPClient:
 
             raise exc
 
-    async def party_send_message(self, content: str,
-                                  retry_on_fail: bool = True) -> Any:
+    async def party_send_message(self, content: str, *, party=None) -> Any:
         if len(content) >= 2048:
             raise ChatError("Message body exceeds max length of 2048")
 
-        if self.client.party.member_count == 1:
+        if party is None:
+            party = self.client.party
+        if party is None or party is not self.client.party:
+            raise ChatError('The client is no longer in this party.')
+        if party.member_count == 1:
             raise ChatError("Client is in a party alone.")
 
-        epic_party_id = self.client.party.epic_party_id
+        epic_party_id = party.epic_party_id
         if epic_party_id:
             scope = '_'
             addressed = f'ep-{epic_party_id}'
@@ -2222,8 +2138,8 @@ class HTTPClient:
             signed_type = "Persistent"
         else:
             scope = self.client.deployment_id
-            addressed = f'p-{self.client.party.id}'
-            signed_conversation_id = self.client.party.id
+            addressed = f'p-{party.id}'
+            signed_conversation_id = party.id
             signed_type = "Party"
 
         body, signature = self.client.create_signed_message(
@@ -2234,15 +2150,13 @@ class HTTPClient:
 
         payload = {
             "allowedRecipients": [
-                member.id for member in self.client.party.members
+                member.id for member in party.members
                 if member.id != self.client.user.id
             ],
             "message": {
                 "body": body
             },
-            "isReportable": bool(getattr(
-                self.client.party, 'is_reportable', False
-            )),
+            "isReportable": party.is_reportable,
             "metadata": {
                 "TmV": "2",
                 "Pub": self.client.key_data.get("jwt"),
@@ -2264,32 +2178,27 @@ class HTTPClient:
             return await self.post(r, json=payload, auth="EAS_ACCESS_TOKEN")
         except HTTPException as exc:
             if (
-                retry_on_fail
+                epic_party_id and party is self.client.party
                 and exc.message_code
                 == "errors.com.epicgames.social.chat.is_reportable_mismatch"
             ):
-                party = self.client.party
-                if party is not None:
-                    party.set_reportable(
-                        not party.is_reportable, from_chat=True
-                    )
-                return await self.party_send_message(
-                    content, retry_on_fail=False
-                )
+                payload['isReportable'] = not payload['isReportable']
+                party.set_reportable(payload['isReportable'], from_chat=True)
+                return await self.post(r, json=payload, auth='EAS_ACCESS_TOKEN')
             raise
 
     ###################################
     #       Public Key Service        #
     ###################################
 
-    async def register_public_key(self, public_key: str) -> dict:
+    async def register_public_key(self, public_key: str, **kwargs: Any) -> dict:
         payload = {
             "key": public_key,
             "algorithm": "ed25519"
         }
 
         r = PublicKeyService('/publickey/v2/publickey/')
-        return await self.post(r, json=payload)
+        return await self.post(r, json=payload, **kwargs)
 
     ###################################
     #         Events Service          #

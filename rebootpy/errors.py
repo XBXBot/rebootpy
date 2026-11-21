@@ -60,6 +60,10 @@ class EventError(FortniteException):
     pass
 
 
+class _RefreshRecoveryFailed(AuthException):
+    """A fresh login failed and the client has started shutting down."""
+
+
 class XMPPError(FortniteException):
     """This exception is raised when something regarding the XMPP service
     fails.
