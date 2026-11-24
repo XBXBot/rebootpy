@@ -11,7 +11,7 @@ import aiohttp
 from rebootpy import AwayStatus, Client, Platform
 from rebootpy.auth import Auth
 from rebootpy.errors import HTTPException, STOMPError, _RefreshRecoveryFailed
-from rebootpy.party import ClientPartyMember, PartyBase, _variant_channels
+from rebootpy.party import ClientPartyMember, PartyBase, PartyMemberMeta, _variant_channels
 from rebootpy.presence import Presence, PresenceParty
 
 
@@ -319,6 +319,32 @@ class PortRegressions(unittest.IsolatedAsyncioTestCase):
             with self.subTest(field=field):
                 party = PartyBase(self.client, {'id': 'lobby', 'config': {field: 123}})
                 self.assertEqual(party.invite_ttl_seconds, 123)
+
+    def test_crown_stats_follow_fnbr_names(self):
+        meta = PartyMemberMeta(SimpleNamespace(client=self.client, id='member'))
+
+        def stats():
+            raw = json.loads(meta.schema['Default:LoadoutMeta_j'])
+            return {item['statName']: item['statValue'] for item in raw['LoadoutMeta']['stats']}
+
+        meta.set_cosmetic_loadout(victory_crowns=4)
+        self.assertEqual(stats()['TotalVictoryCrowns'], 4)
+        self.assertEqual(stats()['TotalRoyalRoyales'], 4)
+        self.assertEqual(stats()['HasCrown'], 1)
+        self.assertEqual(meta.victory_crowns, 4)
+        self.assertEqual(meta.has_crown, 1)
+
+        meta.set_cosmetic_loadout(victory_crowns=0)
+        self.assertEqual(stats()['TotalVictoryCrowns'], 0)
+        self.assertEqual(stats()['HasCrown'], 0)
+
+        meta.set_cosmetic_loadout(has_crown=True)
+        self.assertEqual(meta.has_crown, 1)
+        self.assertEqual(stats()['TotalVictoryCrowns'], 0)
+
+        meta.set_cosmetic_loadout(rank=9)
+        self.assertEqual(meta.rank, 9)
+        self.assertEqual(stats()['HabaneroProgression'], 9)
 
     def test_invalid_index_is_skipped_without_changing_classic_variants(self):
         classic = [{'c': 'Material', 'v': 'Mat1', 'dE': 0}]

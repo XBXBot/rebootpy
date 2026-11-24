@@ -1096,26 +1096,41 @@ class PartyMemberMeta(MetaBase):
         base = self.get_prop('Default:LoadoutMeta_j')
         return base['LoadoutMeta'].get('scratchpad', [])
 
-    @property
-    def has_crown(self) -> list:
-        base = self.get_prop('Default:LoadoutMeta_j')
-        return base['LoadoutMeta'].get(
-            'stats', [{}, {}, {"statName": "HasCrown", "statValue": 0}, {}]
-        )[3]['statValue']
+    def _loadout_stats(self) -> list:
+        loadout = self.get_prop('Default:LoadoutMeta_j')['LoadoutMeta']
+        stats = loadout.get('stats')
+        if not isinstance(stats, list):
+            stats = []
+            loadout['stats'] = stats
+        return stats
+
+    @staticmethod
+    def _stat_value(stats: list, name: str, default: int = 0) -> int:
+        for stat in stats:
+            if isinstance(stat, dict) and stat.get('statName') == name:
+                value = stat.get('statValue', default)
+                return value if isinstance(value, int) else default
+        return default
+
+    @staticmethod
+    def _set_stat(stats: list, name: str, value: int) -> None:
+        for stat in stats:
+            if isinstance(stat, dict) and stat.get('statName') == name:
+                stat['statValue'] = value
+                return
+        stats.append({'statName': name, 'statValue': value})
 
     @property
-    def victory_crowns(self) -> list:
-        base = self.get_prop('Default:LoadoutMeta_j')
-        return base['LoadoutMeta'].get(
-            'stats', [{}, {"statName": "TotalRoyalRoyales", "statValue": 0}, {}, {}]
-        )[2]['statValue']
+    def has_crown(self) -> int:
+        return self._stat_value(self._loadout_stats(), 'HasCrown')
 
     @property
-    def rank(self) -> list:
-        base = self.get_prop('Default:LoadoutMeta_j')
-        return base['LoadoutMeta'].get(
-            'stats', [{}, {}, {}, {"statName": "HabaneroProgression", "statValue": 0}]
-        )[0]['statValue']
+    def victory_crowns(self) -> int:
+        return self._stat_value(self._loadout_stats(), 'TotalVictoryCrowns')
+
+    @property
+    def rank(self) -> int:
+        return self._stat_value(self._loadout_stats(), 'HabaneroProgression')
 
     @property
     def emote(self) -> str:
@@ -1414,12 +1429,20 @@ class PartyMemberMeta(MetaBase):
             mp_loadout['mm']['i'] = self.maybesub(sidekick)
         if scratchpad is not None:
             data['scratchpad'] = scratchpad
-        if has_crown is not None:
-            data['stats'][2]['statValue'] = has_crown
+        stats = data.get('stats')
+        if not isinstance(stats, list):
+            stats = []
+            data['stats'] = stats
         if victory_crowns is not None:
-            data['stats'][1]['statValue'] = victory_crowns
+            crowns = int(victory_crowns)
+            self._set_stat(stats, 'TotalVictoryCrowns', crowns)
+            self._set_stat(stats, 'TotalRoyalRoyales', crowns)
+            if has_crown is None:
+                self._set_stat(stats, 'HasCrown', 1 if crowns > 0 else 0)
+        if has_crown is not None:
+            self._set_stat(stats, 'HasCrown', 1 if has_crown else 0)
         if rank is not None:
-            data['stats'][4]['statValue'] = rank
+            self._set_stat(stats, 'HabaneroProgression', int(rank))
 
         mp_final = {'MpLoadout1': {"s": mp_loadout}}
         mp_key = 'Default:MpLoadout1_j'
@@ -2066,12 +2089,12 @@ class PartyMemberBase(User):
 
     @property
     def has_crown(self) -> bool:
-        """:class:`int`: If this member currently has a crown or not.
+        """:class:`bool`: If this member currently has a crown or not.
         """
         return bool(self.meta.has_crown)
 
     @property
-    def victory_crowns(self) -> List[Tuple[int, int]]:
+    def victory_crowns(self) -> int:
         """:class:`int`: The current crown wins of this member.
         """
         return self.meta.victory_crowns
@@ -3111,7 +3134,11 @@ class ClientPartyMember(PartyMemberBase, Patchable):
     async def set_victory_crowns(self, crowns: int = 0) -> None:
         """|coro|
 
-        Set the amount of victory crowns the user has (must use the 'Crowning Achievement' to show).
+        Set the crown stats the way fnbr.js does.
+
+        ``TotalVictoryCrowns`` and ``TotalRoyalRoyales`` both take
+        ``crowns``. ``HasCrown`` is ``1`` when that amount is above zero.
+        The crown shows while the ``EID_Coronet`` emote is playing.
 
         Parameters
         ----------
