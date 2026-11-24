@@ -658,7 +658,7 @@ class PartyMemberMeta(MetaBase):
                     "priority": 1,
                     "readyStatus": "NotReady",
                     "readyStatusMMId": "",
-                    "result": "CanceledMemberError",
+                    "result": "None",
                     "stayTogetherHash": 0
                 }
             }),

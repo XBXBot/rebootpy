@@ -443,7 +443,9 @@ class PortRegressions(unittest.IsolatedAsyncioTestCase):
         hero = json.loads(member.meta.schema['Default:CampaignHero_j'])
         platform = json.loads(member.meta.schema['Default:PlatformData_j'])
         outfit = json.loads(member.meta.schema['Default:MpLoadout1_j'])
+        matchmaking = json.loads(member.meta.schema['Default:MatchmakingInfo_j'])
         self.assertEqual(hero['CampaignHero']['heroType'], 'None')
+        self.assertEqual(matchmaking['MatchmakingInfo']['result'], 'None')
         self.assertEqual(
             platform['PlatformData']['platform']['platformDescription']['name'],
             'PS5',
