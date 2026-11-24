@@ -9,9 +9,13 @@ from unittest.mock import AsyncMock, Mock
 import aiohttp
 
 from rebootpy import AwayStatus, Client, Platform
+from rebootpy.enums import PartyPrivacy
 from rebootpy.auth import Auth
 from rebootpy.errors import HTTPException, STOMPError, _RefreshRecoveryFailed
-from rebootpy.party import ClientPartyMember, PartyBase, PartyMemberMeta, _variant_channels
+from rebootpy.party import (
+    ClientParty, ClientPartyMember, PartyBase, PartyMember, PartyMemberMeta,
+    ReceivedPartyInvitation, _variant_channels,
+)
 from rebootpy.presence import Presence, PresenceParty
 
 
@@ -319,6 +323,52 @@ class PortRegressions(unittest.IsolatedAsyncioTestCase):
             with self.subTest(field=field):
                 party = PartyBase(self.client, {'id': 'lobby', 'config': {field: 123}})
                 self.assertEqual(party.invite_ttl_seconds, 123)
+
+    async def test_eos_party_actions_follow_fnbr(self):
+        client = self.client
+        party = PartyBase(client, {'id': 'lobby', 'epic_party_id': 'eos-party'})
+        party.me = SimpleNamespace(leader=True)
+        member = PartyMember(client, party, {
+            'id': 'friend', 'revision': 1, 'joined_at': '2026-11-21T00:00:00.000Z',
+        })
+        remove = client.http.epic_party_remove_member = AsyncMock()
+        legacy_kick = client.http.party_kick_member = AsyncMock()
+        await member.kick()
+        remove.assert_awaited_once_with('eos-party', 'friend')
+        legacy_kick.assert_not_awaited()
+
+        promote = client.http.party_promote_member = AsyncMock()
+        eos_promote = client.http.epic_party_promote_member = AsyncMock()
+        await member.promote()
+        promote.assert_awaited_once_with('lobby', 'friend')
+        eos_promote.assert_awaited_once_with('eos-party', 'friend')
+
+        client_party = ClientParty(client, {
+            'id': 'lobby', 'epic_party_id': 'eos-party', 'revision': 1,
+        })
+        client.party = client_party
+        client.store_user = Mock(return_value=SimpleNamespace(id='friend'))
+        send_invite = client.http.epic_party_send_invite = AsyncMock()
+        legacy_invite = client.http.party_send_invite = AsyncMock()
+        ping = client.http.party_send_ping = AsyncMock()
+        await client_party._invite(SimpleNamespace(id='friend', get_raw=lambda: {}))
+        send_invite.assert_awaited_once_with('friend')
+        legacy_invite.assert_not_awaited()
+        ping.assert_not_awaited()
+
+        patch = client_party.patch = AsyncMock()
+        joinability = client.set_epic_party_joinability = AsyncMock()
+        await client_party.set_privacy(PartyPrivacy.PRIVATE)
+        patch.assert_awaited_once()
+        joinability.assert_awaited_once_with('eos-party', 'INVITE_ONLY', reraise=True)
+
+        decline = client.http.epic_party_decline_invite = AsyncMock()
+        invitation = ReceivedPartyInvitation.__new__(ReceivedPartyInvitation)
+        invitation.client = client
+        invitation.epic_party_id = 'eos-party'
+        invitation.sender = SimpleNamespace(id='host')
+        await invitation.decline()
+        decline.assert_awaited_once_with('host')
 
     def test_crown_stats_follow_fnbr_names(self):
         meta = PartyMemberMeta(SimpleNamespace(client=self.client, id='member'))

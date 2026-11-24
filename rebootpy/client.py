@@ -3923,7 +3923,8 @@ class Client(BasicClient):
 
     async def set_epic_party_joinability(self, epic_party_id: str,
                                         joinability: str,
-                                        retried: bool = False) -> None:
+                                        retried: bool = False,
+                                        reraise: bool = False) -> None:
         try:
             await self.http.epic_party_set_config(
                 epic_party_id, joinability, revision=self._epic_party_revision
@@ -3933,9 +3934,11 @@ class Client(BasicClient):
             code = getattr(e, 'message_code', '') or ''
             if not retried and code.endswith('stale_revision'):
                 return await self.set_epic_party_joinability(
-                    epic_party_id, joinability, retried=True
+                    epic_party_id, joinability, retried=True, reraise=reraise
                 )
             log.debug(f'joinability {joinability} failed: {e}')
+            if reraise:
+                raise
 
     async def _emit_epic_party_invite(self, invite: dict) -> None:
         sender_id = invite.get('sent_by')

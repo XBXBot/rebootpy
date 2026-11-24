@@ -1836,6 +1836,22 @@ class HTTPClient:
             **kwargs
         )
 
+    async def epic_party_promote_member(self, epic_party_id: str,
+                                       account_id: str,
+                                       **kwargs: Any) -> Any:
+        r = ChatService(
+            ('/epic/party/internal/v2/parties/{epic_party_id}/members/'
+             '{account_id}/promote'),
+            epic_party_id=epic_party_id,
+            account_id=account_id,
+        )
+        return await self.post(
+            r,
+            json={},
+            auth="EAS_ACCESS_TOKEN",
+            **kwargs
+        )
+
     async def epic_party_remove_member(self, epic_party_id: str,
                                       account_id: str,
                                       **kwargs: Any) -> Any:
@@ -1885,6 +1901,19 @@ class HTTPClient:
             r,
             json=payload,
             params=params,
+            auth="EAS_ACCESS_TOKEN",
+            **kwargs
+        )
+
+    async def epic_party_decline_invite(self, sender_id: str,
+                                        **kwargs: Any) -> Any:
+        r = ChatService(
+            '/epic/party/internal/v2/users/{account_id}/invites/{sender_id}',
+            account_id=self.client.user.id,
+            sender_id=sender_id,
+        )
+        return await self.delete(
+            r,
             auth="EAS_ACCESS_TOKEN",
             **kwargs
         )

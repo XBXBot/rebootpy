@@ -2432,7 +2432,12 @@ class PartyMember(PartyMemberBase):
             raise PartyError('You can\'t kick yourself')
 
         try:
-            await self.client.http.party_kick_member(self.party.id, self.id)
+            if self.party.epic_party_id:
+                await self.client.http.epic_party_remove_member(
+                    self.party.epic_party_id, self.id
+                )
+            else:
+                await self.client.http.party_kick_member(self.party.id, self.id)
         except HTTPException as e:
             m = 'errors.com.epicgames.social.party.party_change_forbidden'
             if e.message_code == m:
@@ -2465,7 +2470,24 @@ class PartyMember(PartyMemberBase):
         if self.client.user.id == self.id:
             raise PartyError('You are already the leader')
 
-        await self.client.http.party_promote_member(self.party.id, self.id)
+        legacy = self.client.http.party_promote_member(self.party.id, self.id)
+        try:
+            if self.party.epic_party_id:
+                await asyncio.gather(
+                    legacy,
+                    self.client.http.epic_party_promote_member(
+                        self.party.epic_party_id, self.id
+                    ),
+                )
+            else:
+                await legacy
+        except HTTPException as e:
+            m = 'errors.com.epicgames.social.party.party_change_forbidden'
+            if e.message_code == m:
+                raise Forbidden(
+                    'You dont have permission to promote this member.'
+                )
+            raise
 
     async def swap_position(self) -> None:
         """|coro|
@@ -4671,18 +4693,14 @@ class ClientParty(PartyBase, Patchable):
             raise PartyError('Party is full')
 
         if self.epic_party_id and self.client.auth.eas_access_token is not None:  # noqa
-            try:
-                await self.client.http.epic_party_send_invite(friend.id)
-            except HTTPException:
-                pass
-            else:
-                return SentPartyInvitation(
-                    self.client,
-                    self,
-                    self.me,
-                    self.client.store_user(friend.get_raw()),
-                    {'sent_at': datetime.datetime.utcnow()}
-                )
+            await self.client.http.epic_party_send_invite(friend.id)
+            return SentPartyInvitation(
+                self.client,
+                self,
+                self.me,
+                self.client.store_user(friend.get_raw()),
+                {'sent_at': datetime.datetime.utcnow()}
+            )
 
         invites = await self.fetch_invites()
 
@@ -4831,11 +4849,20 @@ class ClientParty(PartyBase, Patchable):
             privacy = privacy.value
 
         updated, deleted, config = self.meta.set_privacy(privacy)
-        if not self.edit_lock.locked():
-            return await self.patch(
-                updated=updated,
-                deleted=deleted,
-                config=config,
+        if self.edit_lock.locked():
+            return
+
+        await self.patch(
+            updated=updated,
+            deleted=deleted,
+            config=config,
+        )
+        if self.epic_party_id:
+            joinability = (
+                'INVITE_ONLY' if privacy['partyType'] == 'Private' else 'OPEN'
+            )
+            await self.client.set_epic_party_joinability(
+                self.epic_party_id, joinability, reraise=True
             )
 
     async def set_region(self, region: Region) -> None:
@@ -5077,6 +5104,7 @@ class ReceivedPartyInvitation:
             Something went wrong when declining the invitation.
         """
         if self.epic_party_id:
+            await self.client.http.epic_party_decline_invite(self.sender.id)
             return
 
         await self.client.http.party_delete_ping(self.sender.id)
