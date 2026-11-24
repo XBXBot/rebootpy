@@ -2042,6 +2042,9 @@ class HTTPClient:
         data = await self.get(r, auth="EAS_ACCESS_TOKEN")
         return data.get("page", [])
 
+    def _chat_correlation_id(self) -> str:
+        return f'EOS-{int(time.time() * 1000)}-{uuid.uuid4()}'
+
     async def friend_send_message(self,
                                   user_id: str,
                                   content: str,
@@ -2072,8 +2075,7 @@ class HTTPClient:
 
         body, signature = self.client.create_signed_message(
             conversation_id=friend._conversation_id,
-            content=content,
-            sequence=0
+            content=content
         )
 
         payload = {
@@ -2102,7 +2104,10 @@ class HTTPClient:
         )
 
         try:
-            return await self.post(r, json=payload, auth="EAS_ACCESS_TOKEN")
+            return await self.post(
+                r, json=payload, auth="EAS_ACCESS_TOKEN",
+                headers={'X-Epic-Correlation-ID': self._chat_correlation_id()}
+            )
         except HTTPException as exc:
             if (
                 retry_on_fail
@@ -2161,7 +2166,6 @@ class HTTPClient:
                 "TmV": "2",
                 "Pub": self.client.key_data.get("jwt"),
                 "Sig": signature,
-                "NPM": "1",
                 "PlfNm": self.client.platform.value,
                 "PlfId": self.client.user.id,
             },
@@ -2174,8 +2178,11 @@ class HTTPClient:
             conversation_id=addressed,
             client_id=self.client.user.id
         )
+        headers = {'X-Epic-Correlation-ID': self._chat_correlation_id()}
         try:
-            return await self.post(r, json=payload, auth="EAS_ACCESS_TOKEN")
+            return await self.post(
+                r, json=payload, auth="EAS_ACCESS_TOKEN", headers=headers
+            )
         except HTTPException as exc:
             if (
                 epic_party_id and party is self.client.party
@@ -2184,7 +2191,9 @@ class HTTPClient:
             ):
                 payload['isReportable'] = not payload['isReportable']
                 party.set_reportable(payload['isReportable'], from_chat=True)
-                return await self.post(r, json=payload, auth='EAS_ACCESS_TOKEN')
+                return await self.post(
+                    r, json=payload, auth='EAS_ACCESS_TOKEN', headers=headers
+                )
             raise
 
     ###################################

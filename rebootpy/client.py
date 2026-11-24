@@ -4660,12 +4660,10 @@ class Client(BasicClient):
                               type: str = "Persistent",
                               sequence: int = 1
                               ) -> Tuple[str, str]:
-        timestamp = int(
-            datetime.datetime.now(datetime.timezone.utc).timestamp()
-        )
+        timestamp = int(time.time() * 1000)
 
         message_info = {
-            "mid": uuid.uuid4().hex,
+            "mid": str(uuid.uuid4()),
             "sid": self.user.id,
             "rid": conversation_id,
             "msg": content,
@@ -4677,7 +4675,9 @@ class Client(BasicClient):
         }
 
         body = base64.b64encode(
-            json.dumps(message_info).encode()
+            json.dumps(
+                message_info, separators=(',', ':'), ensure_ascii=False
+            ).encode()
         ).decode("utf-8")
         message = body.encode() + bytes([0])
         signature = self.private_key.sign(message)

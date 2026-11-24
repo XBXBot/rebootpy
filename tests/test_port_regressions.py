@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import json
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -212,6 +214,26 @@ class PortRegressions(unittest.IsolatedAsyncioTestCase):
         await PresenceParty(self.client, {'p': 'a' * 32}).join()
         self.client.join_legacy_party.assert_awaited_once_with('a' * 32)
 
+    def test_signed_message_matches_fnbr(self):
+        self.client.generate_keypair()
+        before = int(time.time() * 1000)
+        body, signature = self.client.create_signed_message(
+            'ep-abc', 'hello', type='Persistent'
+        )
+        info = json.loads(base64.b64decode(body))
+        self.assertRegex(
+            info['mid'],
+            r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+        )
+        self.assertGreaterEqual(info['tst'], before)
+        self.assertLessEqual(info['tst'], int(time.time() * 1000))
+        self.assertGreater(info['tst'], 10**12)
+        self.assertEqual(info['cty'], 'Persistent')
+        self.assertEqual(info['rid'], 'ep-abc')
+        self.assertEqual(info['seq'], 1)
+        self.assertTrue(signature)
+        self.assertNotIn(' ', base64.b64decode(body).decode())
+
     async def test_reportability_retry_stays_in_the_original_party(self):
         client = self.client
         party = PartyBase(client, {'id': 'lobby', 'epic_party_id': 'party'})
@@ -222,8 +244,10 @@ class PortRegressions(unittest.IsolatedAsyncioTestCase):
         values = []
         mismatch = api_error('errors.com.epicgames.social.chat.is_reportable_mismatch')
 
-        async def post(route, *, json, auth):
+        async def post(route, *, json, auth, headers):
             values.append(json['isReportable'])
+            self.assertNotIn('NPM', json['metadata'])
+            self.assertTrue(headers['X-Epic-Correlation-ID'].startswith('EOS-'))
             if len(values) == 1:
                 raise mismatch
 
@@ -235,6 +259,9 @@ class PortRegressions(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(party.is_reportable)
 
         async def switch_party(*args, **kwargs):
+            self.assertTrue(
+                kwargs['headers']['X-Epic-Correlation-ID'].startswith('EOS-')
+            )
             client.party = object()
             raise mismatch
 
