@@ -1694,6 +1694,29 @@ class PartyMeta(MetaBase):
                 }
             }),
             "Default:RegionId_s": "EU",
+            "Default:CurrentRegionId_s": "EU",
+            "Default:SelectedIsland_j": json.dumps({
+                "SelectedIsland": {
+                    "linkId": {"mnemonic": "playlist_defaultsquad", "version": -1},
+                    "worldId": {"iD": "", "ownerId": "INVALID", "name": ""},
+                    "sessionId": "",
+                    "joinInfo": {
+                        "islandJoinability": "CanNotBeJoinedOrWatched",
+                        "bIsWorldJoinable": False,
+                        "sessionKey": "",
+                    },
+                }
+            }),
+            "Default:PlaylistData_j": json.dumps({
+                "PlaylistData": {
+                    "playlistName": "Playlist_DefaultSquad",
+                    "tournamentId": "",
+                    "eventWindowId": "",
+                    "linkId": {"mnemonic": "playlist_defaultsquad", "version": -1},
+                    "bGracefullyUpgraded": False,
+                    "matchmakingRulePreset": "RespectParties",
+                }
+            }),
             "Default:PrivacySettings_j": json.dumps({
                 'PrivacySettings': privacy_settings,
             }),
@@ -1706,6 +1729,27 @@ class PartyMeta(MetaBase):
             self.update(meta, raw=True)
 
         self.meta_ready_event.set()
+
+    def set_selected_island(self, playlist: str, version: int = -1) -> Dict[str, Any]:
+        selected = self.get_prop('Default:SelectedIsland_j')
+        selected['SelectedIsland']['linkId'] = {
+            'mnemonic': playlist,
+            'version': version,
+        }
+        playlist_data = self.get_prop('Default:PlaylistData_j')
+        playlist_data['PlaylistData']['playlistName'] = playlist
+        playlist_data['PlaylistData']['linkId'] = {
+            'mnemonic': playlist,
+            'version': version,
+        }
+        return {
+            'Default:SelectedIsland_j': self.set_prop(
+                'Default:SelectedIsland_j', selected
+            ),
+            'Default:PlaylistData_j': self.set_prop(
+                'Default:PlaylistData_j', playlist_data
+            ),
+        }
 
     @property
     def region(self) -> str:
@@ -4808,25 +4852,25 @@ class ClientParty(PartyBase, Patchable):
         if me is not None:
             me._cancel_clear_emote()
 
-        if self.epic_party_id:
-            try:
-                await self.client.http.epic_party_leave(
-                    self.epic_party_id,
-                    priority=priority
-                )
-            except HTTPException:
-                pass
-
+        missing = 'errors.com.epicgames.social.party.party_not_found'
         try:
             await self.client.http.party_leave(
                 self.id,
                 priority=priority
             )
         except HTTPException as e:
-            m = 'errors.com.epicgames.social.party.party_not_found'
-            if ignore_not_found and e.message_code == m:
-                return
-            raise
+            if not (ignore_not_found and e.message_code == missing):
+                raise
+
+        if self.epic_party_id:
+            try:
+                await self.client.http.epic_party_leave(
+                    self.epic_party_id,
+                    priority=priority
+                )
+            except HTTPException as e:
+                if e.message_code != missing:
+                    raise
 
     async def set_privacy(self, privacy: PartyPrivacy) -> None:
         """|coro|
@@ -4978,10 +5022,20 @@ class ClientParty(PartyBase, Patchable):
             'max_size': size
         }
 
-        if not self.edit_lock.locked():
-            return await self.patch(config=config)
-        else:
+        if self.edit_lock.locked():
             self._config_cache.update(config)
+            return
+
+        await self.patch(config=config)
+        if self.epic_party_id:
+            privacy = self.config['privacy']['partyType']
+            await self.client.http.epic_party_set_config(
+                self.epic_party_id,
+                'INVITE_ONLY' if privacy == 'Private' else 'OPEN',
+                revision=self.client._epic_party_revision,
+                max_size=size,
+            )
+            self.client._epic_party_revision += 1
 
     async def set_playlist(self, playlist: str = "", version: int = -1) -> None:
         """|coro|
@@ -5010,6 +5064,10 @@ class ClientParty(PartyBase, Patchable):
         """
 
         await self.me._set_playlist(playlist=playlist, version=version)
+        if self.edit_lock.locked():
+            return
+        updated = self.meta.set_selected_island(playlist, version)
+        await self.patch(updated=updated)
 
 
 class ReceivedPartyInvitation:

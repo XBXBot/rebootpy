@@ -396,6 +396,42 @@ class PortRegressions(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(meta.rank, 9)
         self.assertEqual(stats()['HabaneroProgression'], 9)
 
+    async def test_party_island_size_and_leave_follow_fnbr(self):
+        party = ClientParty(self.client, {
+            'id': 'lobby', 'epic_party_id': 'eos-party', 'revision': 1,
+        })
+        self.assertEqual(party.meta.get_prop('Default:CurrentRegionId_s'), 'EU')
+        updated = party.meta.set_selected_island('playlist_defaultduo', 3)
+        island = json.loads(updated['Default:SelectedIsland_j'])
+        playlist = json.loads(updated['Default:PlaylistData_j'])
+        self.assertEqual(
+            island['SelectedIsland']['linkId'],
+            {'mnemonic': 'playlist_defaultduo', 'version': 3},
+        )
+        self.assertEqual(playlist['PlaylistData']['playlistName'], 'playlist_defaultduo')
+
+        party.patch = AsyncMock()
+        self.client._epic_party_revision = 4
+        config = self.client.http.epic_party_set_config = AsyncMock()
+        await party.set_max_size(8)
+        config.assert_awaited_once_with(
+            'eos-party', 'OPEN', revision=4, max_size=8,
+        )
+        self.assertEqual(self.client._epic_party_revision, 5)
+
+        order = []
+
+        async def leave_fortnite(*args, **kwargs):
+            order.append('fortnite')
+
+        async def leave_eos(*args, **kwargs):
+            order.append('eos')
+
+        self.client.http.party_leave = AsyncMock(side_effect=leave_fortnite)
+        self.client.http.epic_party_leave = AsyncMock(side_effect=leave_eos)
+        await party._leave()
+        self.assertEqual(order, ['fortnite', 'eos'])
+
     def test_invalid_index_is_skipped_without_changing_classic_variants(self):
         classic = [{'c': 'Material', 'v': 'Mat1', 'dE': 0}]
         self.assertEqual(_variant_channels(classic), classic)

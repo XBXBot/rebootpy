@@ -1748,9 +1748,14 @@ class HTTPClient:
         )
 
     async def epic_party_set_config(self, epic_party_id: str, joinability: str,
-                                   revision: int = 0, **kwargs: Any) -> Any:
+                                   revision: int = 0,
+                                   max_size: Optional[int] = None,
+                                   **kwargs: Any) -> Any:
+        config = {'joinability': joinability}
+        if max_size is not None:
+            config['max_size'] = max_size
         payload = {
-            'config': {'joinability': joinability},
+            'config': config,
             'revision': revision,
         }
         r = ChatService(
