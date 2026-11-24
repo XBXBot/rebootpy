@@ -1000,12 +1000,28 @@ class PartyMemberMeta(MetaBase):
             })
         }
 
+        client = member.client
+        owns_member = (
+            member.id == client.user.id
+            and isinstance(member, ClientPartyMember)
+        )
+        if owns_member:
+            # The game hides a member created by the client when this still
+            # points at the old default hero. The equipped skin lives in the
+            # loadout instead.
+            hero = self.get_prop('Default:CampaignHero_j')
+            hero['CampaignHero']['heroType'] = 'None'
+            self.set_prop('Default:CampaignHero_j', hero)
+            platform = self.get_prop('Default:PlatformData_j')
+            platform['PlatformData']['platform']['platformDescription']['name'] = (
+                client.platform.value
+            )
+            self.set_prop('Default:PlatformData_j', platform)
+
         if meta is not None:
             self.update(meta, raw=True)
 
-        client = member.client
-        if member.id == client.user.id and isinstance(member,
-                                                      ClientPartyMember):
+        if owns_member:
             fut = asyncio.ensure_future(
                 member._edit(*member._default_config.meta)
             )

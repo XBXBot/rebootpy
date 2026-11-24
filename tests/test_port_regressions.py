@@ -16,6 +16,7 @@ from rebootpy.party import (
     ClientParty, ClientPartyMember, PartyBase, PartyMember, PartyMemberMeta,
     ReceivedPartyInvitation, _variant_channels,
 )
+from rebootpy.enums import Platform
 from rebootpy.presence import Presence, PresenceParty
 
 
@@ -431,6 +432,35 @@ class PortRegressions(unittest.IsolatedAsyncioTestCase):
         self.client.http.epic_party_leave = AsyncMock(side_effect=leave_eos)
         await party._leave()
         self.assertEqual(order, ['fortnite', 'eos'])
+
+    def test_client_member_hides_the_default_hero(self):
+        self.client.platform = Platform.PLAYSTATION_5
+        party = PartyBase(self.client, {'id': 'lobby'})
+        member = ClientPartyMember(self.client, party, {
+            'id': 'self', 'account_id': 'self',
+            'joined_at': '2026-11-24T00:00:00.000Z', 'meta': {},
+        })
+        hero = json.loads(member.meta.schema['Default:CampaignHero_j'])
+        platform = json.loads(member.meta.schema['Default:PlatformData_j'])
+        outfit = json.loads(member.meta.schema['Default:MpLoadout1_j'])
+        self.assertEqual(hero['CampaignHero']['heroType'], 'None')
+        self.assertEqual(
+            platform['PlatformData']['platform']['platformDescription']['name'],
+            'PS5',
+        )
+        self.assertTrue(outfit['MpLoadout1']['s']['ac']['i'])
+
+        kept = ClientPartyMember(self.client, party, {
+            'id': 'self', 'account_id': 'self',
+            'joined_at': '2026-11-24T00:00:00.000Z',
+            'meta': {
+                'Default:CampaignHero_j': json.dumps({
+                    'CampaignHero': {'heroItemInstanceId': '', 'heroType': 'HID_Keep'},
+                }),
+            },
+        })
+        stored = json.loads(kept.meta.schema['Default:CampaignHero_j'])
+        self.assertEqual(stored['CampaignHero']['heroType'], 'HID_Keep')
 
     def test_invalid_index_is_skipped_without_changing_classic_variants(self):
         classic = [{'c': 'Material', 'v': 'Mat1', 'dE': 0}]
