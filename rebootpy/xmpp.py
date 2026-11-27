@@ -588,6 +588,9 @@ class XMPPClient:
         if fut is not None:
             await fut
 
+        if party is not None:
+            party.update_presence()
+
         self.client.dispatch_event('internal_party_member_join', member)
 
         if self.client.wait_for_member_meta_in_events:
@@ -628,6 +631,9 @@ class XMPPClient:
         if party.me and party.me.leader and member.id != party.me.id:
             await party.refresh_squad_assignments()
 
+        if self.client.party is party:
+            party.update_presence()
+
         self.client.dispatch_event('party_member_leave', member)
 
     @EventDispatcher.event('com.epicgames.social.party.notification.v0.MEMBER_KICKED')  # noqa
@@ -659,6 +665,8 @@ class XMPPClient:
             p = await self.client._create_party()
 
             self.client.party = p
+        elif self.client.party is party:
+            party.update_presence()
 
         self.client.dispatch_event('party_member_kick', member)
 

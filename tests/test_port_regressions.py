@@ -101,8 +101,16 @@ class PortRegressions(unittest.IsolatedAsyncioTestCase):
 
     async def test_stomp_reads_text_and_binary_recovers_after_auth_error(self):
         stomp = self.client.websocket
-        self.client.recover_party = AsyncMock()
-        self.client.send_eos_presence = AsyncMock()
+        order = []
+
+        async def recover(*args, **kwargs):
+            order.append('party')
+
+        async def presence(*args, **kwargs):
+            order.append('presence')
+
+        self.client.recover_party = AsyncMock(side_effect=recover)
+        self.client.send_eos_presence = AsyncMock(side_effect=presence)
         self.client.party = object()
         connected = 'CONNECTED\nheart-beat:0,0\n\n\x00'
         first = Socket('\n' + connected + frame('core.connect.v1.connected', connectionId='one'))
@@ -112,6 +120,7 @@ class PortRegressions(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(stomp.private_connection_id.startswith('one#sub-eas-private-'))
         first.feed('ERROR\n\n{"statusCode":4019}\x00')
         await wait_for(lambda: stomp.connection_id == 'two' and stomp._reconnect_attempt == 0)
+        await wait_for(lambda: 'party' in order and 'presence' in order[order.index('party') + 1:])
         self.client.recover_party.assert_awaited_once_with(True)
         self.assertTrue(first.closed)
         self.assertTrue(stomp.public_connection_id.startswith('two#sub-eas-'))
@@ -194,6 +203,7 @@ class PortRegressions(unittest.IsolatedAsyncioTestCase):
         self.client.websocket.private_connection_id = 'private'
         send = self.client.http.eos_presence_send = AsyncMock()
         await self.client.send_eos_presence()
+        self.assertEqual([call.args[0] for call in send.await_args_list], ['public', 'private'])
         calls = {call.args[0]: call.args[1] for call in send.await_args_list}
         self.assertEqual(calls['public']['status'], 'away')
         self.assertEqual(calls['public']['props']['FortPartySize'], 'i2')
@@ -201,6 +211,20 @@ class PortRegressions(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"p": "lobby"', calls['public']['props']['party.joininfodata.286331153'])
         self.assertEqual(calls['private']['status'], 'away')
         self.assertEqual(calls['private']['party']['id'], 'party')
+        self.assertEqual(calls['private']['party']['type'], 'OPEN')
+        self.assertTrue(calls['private']['party']['clientJoinable'])
+
+        self.client.party.config['privacy']['partyType'] = 'Private'
+        self.client.party.config['privacy']['presencePermission'] = 'Noone'
+        send.reset_mock()
+        await self.client.send_eos_presence()
+        private_calls = {call.args[0]: call.args[1] for call in send.await_args_list}
+        self.assertEqual(
+            private_calls['public']['props']['party.joininfodata.286331153'],
+            'm{"bIsPrivate":true}',
+        )
+        self.assertEqual(private_calls['private']['party']['type'], 'INVITE_ONLY')
+        self.assertFalse(private_calls['private']['party']['clientJoinable'])
 
     async def test_presence_without_activity_and_legacy_presence(self):
         modern = Presence(self.client, {'perNs': [{

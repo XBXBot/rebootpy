@@ -368,11 +368,12 @@ class WebsocketClient:
                 await websocket.close()
             return
 
-        if self.client.is_ready():
-            try:
-                await self.client.send_eos_presence()
-            except Exception as exc:
-                log.debug('STOMP presence failed: %s', exc)
+        if websocket.closed or self.websocket is not websocket:
+            return
+        try:
+            await self.client.send_eos_presence()
+        except Exception as exc:
+            log.debug('STOMP presence failed: %s', exc)
 
     async def _sleep_before_reconnect(self, had_party: bool) -> bool:
         limit = getattr(self.client, 'stomp_max_connection_retries', 4)

@@ -3486,113 +3486,107 @@ class Client(BasicClient):
         await asyncio.shield(self._party_recovery)
 
     def _build_eos_presence(self, status: Optional[str] = None) -> dict:
-        party_size = self.party.member_count if self.party else 1
+        party = self.party
+        party_size = party.member_count if party else 1
+        max_size = party.max_size if party else 1
         if status is not None:
             status_value = status
         elif isinstance(self.status, str):
             status_value = self.status.format(
                 party_size=party_size,
-                party_max_size=self.party.max_size if self.party else 1,
+                party_max_size=max_size,
                 current_playlist=self.current_status_playlist,
             )
+        elif party is not None:
+            status_value = f'Lobby - {party_size} / {max_size}'
         else:
-            status_value = 'In Lobby'
+            status_value = 'Playing Battle Royale'
 
-        gameplay_stats_json = json.dumps({
-            'state': '',
-            'playlist': 'None',
-            'numKills': 0,
-            'bFellToDeath': False,
-        })
-        social_status_json = json.dumps({'attendingSocialEventIds': []})
-
-        payload = {
-            'status': self._presence_online_type(),
-            'activity': {'value': status_value},
-            'props': {
+        props = {
+            'EOS_Platform': self.platform.value,
+            'EOS_IntegratedPlatform': 'EGS',
+            'EOS_OnlinePlatformType': '100',
+            'EOS_ProductVersion': self.build,
+            'EOS_ProductName': 'Fortnite',
+            'EOS_Session': json.dumps({'version': 3}),
+            'EOS_Lobby': json.dumps({'version': 3}),
+        }
+        if party is not None:
+            props.update({
                 'FortBasicInfo': f'm{json.dumps({"homeBaseRating": 0})}',
                 'FortLFG': 'i0',
                 'FortPartySize': f'i{party_size}',
                 'FortSubGame': 'i1',
                 'IslandCode': f's{self._presence_island_code()}',
                 'IsInZone': 'bfalse',
-                'FortGameplayStats': f'm{gameplay_stats_json}',
-                'SocialStatus': f'm{social_status_json}',
+                'FortGameplayStats': 'm' + json.dumps({
+                    'state': '',
+                    'playlist': 'None',
+                    'numKills': 0,
+                    'bFellToDeath': False,
+                }),
+                'SocialStatus': 'm' + json.dumps({
+                    'attendingSocialEventIds': []
+                }),
                 'InUnjoinableMatch': 'bfalse',
-                'party.joininfodata.286331153': 'm{"bIsPrivate":true}',
-                'EOS_Platform': self.platform.value,
-                'EOS_IntegratedPlatform': 'EGS',
-                'EOS_OnlinePlatformType': '100',
-                'EOS_ProductVersion': self.build,
-                'EOS_ProductName': 'Fortnite',
-                'EOS_Session': json.dumps({'version': 3}),
-                'EOS_Lobby': json.dumps({'version': 3}),
-            },
+            })
+            if self._presence_is_public():
+                props['party.joininfodata.286331153'] = 'm' + json.dumps({
+                    'sDN': self.user.display_name,
+                    'sP': self.platform.value,
+                    'p': party.id,
+                    'd': 'Fortnite',
+                    'b': self.party_build_id,
+                    'f': 6,
+                    'nAR': 0,
+                    'pc': party.member_count,
+                })
+            else:
+                props['party.joininfodata.286331153'] = 'm{"bIsPrivate":true}'
+
+        return {
+            'status': self._presence_online_type(),
+            'activity': {'value': status_value},
+            'props': props,
             'conn': {'props': {}},
         }
 
-        if self.party is not None and self._presence_is_public():
-            join_info = {
-                "sDN": self.user.display_name,
-                "sP": self.platform.value,
-                "p": self.party.id,
-                "d": "Fortnite",
-                "b": self.party_build_id,
-                "f": 6,
-                "nAR": 0,
-                "pc": self.party.member_count,
-            }
-            payload['props']['party.joininfodata.286331153'] = (
-                'm' + json.dumps(join_info)
-            )
-        return payload
-
     async def send_eos_presence(self, raw_status: Optional[dict] = None) -> None:
-        connection_id = self.websocket.connection_id
-        if not connection_id:
+        public_connection_id = self.websocket.public_connection_id
+        private_connection_id = self.websocket.private_connection_id
+        if not public_connection_id and not private_connection_id:
             return
 
-        public_connection_id = self.websocket.public_connection_id or connection_id
-        private_connection_id = self.websocket.private_connection_id or connection_id
-        payload = self._build_eos_presence(raw_status.get('Status') if raw_status else None)
-
-        epic_party_id = self.party.epic_party_id if self.party else None
+        status_text = raw_status.get('Status') if isinstance(raw_status, dict) else None
+        payload = self._build_eos_presence(status_text)
+        party = self.party
+        epic_party_id = party.epic_party_id if party is not None else None
         internal_presence = {
             'status': self._presence_online_type(),
             'activity': {},
             'conn': {'props': {}},
         }
         if epic_party_id:
-            is_private = self.party.config['privacy']['partyType'] == 'Private'  # noqa
+            privacy = party.config.get('privacy') or {}
+            is_private = privacy.get('partyType') == 'Private'
             internal_presence['party'] = {
                 'type': 'INVITE_ONLY' if is_private else 'OPEN',
                 'id': epic_party_id,
-                'clientJoinable': True,
-                'memberCount': self.party.member_count,
+                'clientJoinable': not is_private,
+                'memberCount': party.member_count,
                 'timestamp': to_iso(
                     datetime.datetime.now(datetime.timezone.utc)
                 ),
             }
 
-        try:
-            await self.http.eos_presence_send(connection_id, payload)
-        except HTTPException as e:
-            log.debug(f'Failed to send presence: {e}')
-
-        if public_connection_id != connection_id:
+        if public_connection_id:
             try:
-                await self.http.eos_presence_send(
-                    public_connection_id, payload
-                )
-                log.debug(
-                    f'Uploaded public presence - {payload}'
-                )
+                await self.http.eos_presence_send(public_connection_id, payload)
+                log.debug(f'Uploaded public presence - {payload}')
             except HTTPException as e:
-                log.debug(
-                    f'Failed to send public presence: {e}'
-                )
+                log.debug(f'Failed to send public presence: {e}')
 
-        if private_connection_id != connection_id:
+        if private_connection_id:
             try:
                 await self.http.eos_presence_send(
                     private_connection_id, internal_presence, internal=True
@@ -3602,9 +3596,7 @@ class Client(BasicClient):
                     f'{internal_presence}'
                 )
             except HTTPException as e:
-                log.debug(
-                    f'Failed to send internal presence: {e}'
-                )
+                log.debug(f'Failed to send internal presence: {e}')
 
     async def _create_epic_party(self, party_config: dict,
                                 priority: int = 0) -> Tuple[dict, str]:

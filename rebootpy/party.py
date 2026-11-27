@@ -4416,6 +4416,9 @@ class ClientParty(PartyBase, Patchable):
                 status=self.last_raw_status,
                 show=self.client.away.value,
             )
+            loop = getattr(self.client, 'loop', None)
+            if loop is not None and loop.is_running():
+                loop.create_task(self.client.send_eos_presence(data))
 
     def _update(self, data: dict) -> None:
         super()._update(data)
